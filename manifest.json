@@ -1,0 +1,9 @@
+{
+  "id": "atlas-3d",
+  "name": "Atlas 3D",
+  "version": "0.3.0",
+  "minAppVersion": "1.8.7",
+  "description": "Companion for Atlas VTT: isometric 3D map with editable terrain, 3D tokens and Fantasy Statblocks panels. Does not modify Atlas.",
+  "author": "Your name",
+  "isDesktopOnly": true
+}

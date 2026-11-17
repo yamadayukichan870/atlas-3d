@@ -1,0 +1,22 @@
+{
+  "name": "atlas-3d",
+  "version": "0.3.0",
+  "description": "3D map companion for Atlas VTT (Obsidian)",
+  "private": true,
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "test": "node test/run.mjs"
+  },
+  "license": "AGPL-3.0-only",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "latest",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "three": "^0.180.0",
+    "@types/three": "^0.180.0"
+  }
+}

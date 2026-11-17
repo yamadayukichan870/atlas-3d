@@ -1,9 +1,11 @@
 import * as THREE from 'three';
-import { CameraController, type CameraKind, type PanDirection, type ViewPreset } from '../camera/CameraController';
-import { GridLayer, type GridStyle } from '../grid/GridLayer';
+import type { AtlasMeasurementSettings, MovementRules } from '../atlas/measureRules';
+import type { AreaTokenTarget } from '../terrain/measureGeometry';
 import type { BlockMap } from '../terrain/blocks';
 import { computeLayout, type Layout } from '../terrain/layout';
 import { TokenLayer, type ScreenPoint, type TokenDragInfo, type TokenPlacementContext, type TokenSpec } from '../tokens/TokenLayer';
+import { CameraController, type CameraKind, type PanDirection, type ViewPreset } from '../camera/CameraController';
+import { GridLayer, type GridStyle } from '../grid/GridLayer';
 import {
   TacticalOverlays,
   type LosDisplay,
@@ -44,14 +46,23 @@ export interface MapSpec { widthPx: number; heightPx: number; texture: THREE.Tex
 export interface SurfaceHit { point: THREE.Vector3; normal: THREE.Vector3 }
 export interface MoveSurfaceHit { point: THREE.Vector3; floorCeiling: number }
 
+/** What the scene hands the tactical layer so areas, ranges and auras measure as Atlas does. */
+export interface MeasureContextData {
+  rules?: AtlasMeasurementSettings;
+  movement?: MovementRules;
+  tokens?: readonly AreaTokenTarget[];
+  selectedIds?: readonly string[];
+  speed?: number | null;
+}
+
 function sampleTextureLuminance(texture: THREE.Texture | null | undefined): number {
   const image = texture?.image as CanvasImageSource | undefined;
   if (!image) return 0.5;
   try {
-    const sample = createEl('canvas');
-    sample.width = 16;
-    sample.height = 16;
-    const ctx = sample.getContext('2d');
+    const canvas = createEl('canvas');
+    canvas.width = 16;
+    canvas.height = 16;
+    const ctx = canvas.getContext('2d');
     if (!ctx) return 0.5;
     ctx.drawImage(image, 0, 0, 16, 16);
     const data = ctx.getImageData(0, 0, 16, 16).data;
@@ -73,6 +84,8 @@ export class SceneRenderer {
   readonly canvas: HTMLCanvasElement;
   onFrame: (() => void) | null = null;
   onUnpinMeasure: ((id: string) => void) | null = null;
+  /** Called by a measurement pill's Select (N) button; the scene selects those tokens in Atlas. */
+  onSelectTokens: ((ids: readonly string[]) => void) | null = null;
 
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene = new THREE.Scene();
@@ -94,6 +107,7 @@ export class SceneRenderer {
   private frame = 0;
   private disposed = false;
   private readonly center = new THREE.Vector3();
+  private measureCtx: MeasureContextData = {};
 
   constructor(private readonly host: HTMLElement, private readonly source: TerrainSource) {
     this.canvas = host.createEl('canvas', { cls: 'atlas3d-canvas' });
@@ -101,6 +115,7 @@ export class SceneRenderer {
     this.renderer.setClearColor(0x14161a);
 
     this.tactical = new TacticalOverlays(host, (id) => this.onUnpinMeasure?.(id));
+    this.tactical.onSelectTokens = (ids) => this.onSelectTokens?.(ids);
 
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x6a6f7a, 1.9));
     const sun = new THREE.DirectionalLight(0xffffff, 1.6);
@@ -138,12 +153,19 @@ export class SceneRenderer {
     return this.ceilingY();
   }
 
+  /** The scene feeds rules, token footprints and selection so the tactical layer measures as Atlas. */
+  setMeasureContext(data: MeasureContextData): void {
+    this.measureCtx = data;
+  }
+
   tacticalContext(): TacticalOverlayContext | null {
     if (!this.layout) return null;
     return {
       layout: this.layout,
       map: this.source.map,
       maxLayer: this.maxLayer ?? Infinity,
+      gridSize: this.grid?.size ?? 1,
+      ...this.measureCtx,
     };
   }
 
@@ -406,8 +428,8 @@ export class SceneRenderer {
     }
 
     const planeHit = this.pickPlane(event, 0);
-    if (!planeHit) return null;
-    if (!snap || !layout) return planeHit;
+    if (!planeHit || !layout) return planeHit;
+    if (!snap) return planeHit;
     const cx = Math.floor(planeHit.x - layout.originX);
     const cz = Math.floor(planeHit.z - layout.originZ);
     return new THREE.Vector3(layout.originX + cx + 0.5, 0, layout.originZ + cz + 0.5);
@@ -532,7 +554,7 @@ export class SceneRenderer {
     this.renderer.render(this.scene, this.cameraRig.camera);
     this.tactical.updateScreenLabels(this.cameraRig.camera, this.host.clientWidth, this.host.clientHeight);
     this.onFrame?.();
-    if (animating) this.invalidate();
+    if (animating || this.tactical.isAnimating()) this.invalidate();
   }
 
   private aim(event: MouseEvent): boolean {

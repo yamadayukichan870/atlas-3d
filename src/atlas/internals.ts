@@ -51,25 +51,56 @@ function tokenRendererOf(leaf: WorkspaceLeaf | null): unknown {
 }
 
 /**
- * Reads the scene's active collection settings object from Atlas's asset service.
+ * Atlas's asset service for this view. `ServiceManager.getAssetService()` is the public accessor;
+ * the private `assetService` field is the fallback (TypeScript `private` is compile-time only, so it
+ * is readable at runtime). Null when the asset manager feature is off or the service is unreachable.
+ */
+function assetServiceOf(leaf: WorkspaceLeaf | null): unknown {
+  const manager = field(viewOf(leaf), 'serviceManager');
+  return call(manager, 'getAssetService') ?? field(manager, 'assetService') ?? null;
+}
+
+/** The store of the view, by its public getter or the `atlasStore` field. */
+function storeOf(leaf: WorkspaceLeaf | null): unknown {
+  const view = viewOf(leaf);
+  const direct = field(view, 'atlasStore');
+  if (direct !== undefined) return direct;
+  return call(view, 'getStore') ?? null;
+}
+
+/**
+ * The collection a map belongs to, resolved the way Atlas resolves its rules: from the map's path
+ * (`AssetService.getCollectionForMap`), NOT from `state.currentCollectionId`. That field is a UI
+ * convenience initialised to 'default' and never persisted; Atlas's own `rulesForMap` ignores it.
+ * Null when the map lies outside every collection, or the service cannot be reached.
+ */
+export function mapCollectionIdOf(leaf: WorkspaceLeaf | null): string | null {
+  const service = assetServiceOf(leaf);
+  const state = call(storeOf(leaf), 'getState');
+  if (!service || !state) return null;
+  const mapPath = field(state, 'mapPath');
+  if (typeof mapPath !== 'string' || mapPath === '') return null;
+  const id = call(service, 'getCollectionForMap', mapPath);
+  return typeof id === 'string' && id !== '' ? id : null;
+}
+
+/**
+ * The scene's collection settings object, read from the collection Atlas measures the map by.
  *
  * Null when the map belongs to no collection: Atlas measures such a map by its own grid state,
- * not by a collection called "Default". The literal this used to fall back to named a folder that
- * may not exist, and hid the difference between "no collection" and "a collection we could not read".
+ * not by a collection called "Default". Resolving by `mapPath` (as `rulesForMap` does) is what
+ * fixes reading the stale `currentCollectionId` ('default') instead of the map's real collection.
+ *
+ * Note: a campaign's played system wins over the collection in Atlas (`rulesForMap`); that override
+ * is not probed here yet. A returned object may legitimately hold no `gridDefaults`/`movement`
+ * (the collection then takes its game-system preset's or the built-in defaults).
  */
 export function readCollectionSettings(leaf: WorkspaceLeaf | null): unknown {
-  const view = viewOf(leaf);
-  const assetService = call(field(view, 'serviceManager'), 'getAssetService');
-  const store = field(view, 'atlasStore');
-  const state = call(store, 'getState');
-  if (!assetService || !state) return null;
-  const colIdField = field(state, 'currentCollectionId');
-  const mapPath = field(state, 'mapPath');
-  const colId = typeof colIdField === 'string' && colIdField !== ''
-    ? colIdField
-    : (typeof mapPath === 'string' ? call(assetService, 'getCollectionForMap', mapPath) : null);
-  if (typeof colId !== 'string' || colId === '') return null;
-  return call(assetService, 'getCollectionSettings', colId) ?? null;
+  const service = assetServiceOf(leaf);
+  if (!service) return null;
+  const id = mapCollectionIdOf(leaf);
+  if (id === null) return null;
+  return call(service, 'getCollectionSettings', id) ?? null;
 }
 
 /** The resource definitions of the scene's collection, exactly as Atlas hands them over (unvalidated). */
@@ -228,6 +259,8 @@ export interface Capability {
   ok: boolean;
   /** What happens instead when it is not. */
   without: string;
+  /** Optional context (e.g. which collection was resolved), shown after the feature in the report. */
+  detail?: string;
 }
 
 const isFn = (target: unknown, name: string): boolean => typeof field(target, name) === 'function';
@@ -271,9 +304,21 @@ export function inspect(leaf: WorkspaceLeaf | null): Capability[] {
   // A scene with nothing measured yet may hold no `measures` record at all; the action's presence
   // is what says this Atlas has the kept-measurement model.
   const hasMeasures = recordOf(field(objects, 'measures')) !== null || isFn(state, 'addMeasure');
+
+  // The collection is resolved by mapPath, as Atlas's own rulesForMap does. `serviceOk` says the
+  // probe itself works; `collectionId` says which collection (null = the map is outside them all).
+  const service = assetServiceOf(leaf);
+  const serviceOk = service !== null && isFn(service, 'getCollectionForMap') && isFn(service, 'getCollectionSettings');
+  const collectionId = serviceOk ? mapCollectionIdOf(leaf) : null;
   const collection = recordOf(readCollectionSettings(leaf));
   const gridDefaults = recordOf(field(collection, 'gridDefaults'));
   const movement = recordOf(field(collection, 'movement'));
+
+  const collectionDetail = !serviceOk
+    ? 'asset service not reachable'
+    : collectionId !== null
+      ? `collection "${collectionId}"`
+      : 'map belongs to no collection (measures by its grid)';
 
   return [
     {
@@ -379,16 +424,29 @@ export function inspect(leaf: WorkspaceLeaf | null): Capability[] {
       without: 'auras can be read but not changed from the 3D map',
     },
     {
+      id: 'collection',
+      feature: 'Finding the collection a map belongs to (the source of its rules)',
+      ok: serviceOk,
+      without: 'the 3D map cannot read collection rules and measures by the map grid alone',
+      detail: collectionDetail,
+    },
+    {
       id: 'collectionRules',
       feature: 'The collection measurement rules (diagonals, units, cone, bands)',
       ok: gridDefaults !== null,
-      without: 'the 3D map measures by the map grid alone, which may differ from Atlas',
+      without: 'the collection stores no grid defaults; both views measure by the map grid and built-in defaults',
+      ...(gridDefaults === null && serviceOk && collectionId !== null
+        ? { detail: 'no stored gridDefaults; Atlas uses defaults / the game-system preset' }
+        : {}),
     },
     {
       id: 'movementRules',
       feature: 'Movement steps and per-turn counting',
       ok: movement !== null,
       without: 'a move is not coloured by step, and movement is not counted per turn',
+      ...(movement === null && serviceOk && collectionId !== null
+        ? { detail: 'no stored movement; Atlas uses the game-system preset' }
+        : {}),
     },
     {
       id: 'chrome',
@@ -403,7 +461,8 @@ export function inspect(leaf: WorkspaceLeaf | null): Capability[] {
 export function formatReport(atlasVersion: string | null, capabilities: readonly Capability[]): string {
   const lines = [`Atlas VTT ${atlasVersion ?? '(version unknown)'}`, ''];
   for (const c of capabilities) {
-    lines.push(c.ok ? `[ok] ${c.feature}` : `[MISSING] ${c.feature} - without it: ${c.without}`);
+    const suffix = c.detail !== undefined ? `  (${c.detail})` : '';
+    lines.push(c.ok ? `[ok] ${c.feature}${suffix}` : `[MISSING] ${c.feature} - without it: ${c.without}${suffix}`);
   }
   const present = capabilities.filter((c) => c.ok).length;
   lines.push('', `${present} of ${capabilities.length} hooks available`);

@@ -1,3 +1,6 @@
+import type { AtlasMeasure, AtlasMeasureChanges, AtlasPoint, AtlasSceneRules, AtlasTokenAura } from '../atlas/types';
+import type { AtlasMeasureShape } from '../atlas/measureRules';
+import type { AreaTokenTarget } from '../terrain/measureGeometry';
 import type { BlockChange, BlockMap } from '../terrain/blocks';
 import type { SceneRenderer, Tool } from '../view/SceneRenderer';
 import { BuildTool } from './BuildTool';
@@ -7,6 +10,33 @@ import { MoveTokenTool } from './MoveTokenTool';
 import { OrbitTool } from './OrbitTool';
 import { SculptTool } from './SculptTool';
 import { CLICK_SLOP_PX, type BuildState, type MeasureState, type ToolContext, type ToolHandler } from './ToolController';
+
+/**
+ * The pointer dispatcher: it owns the canvas listeners and hands each gesture to the active
+ * tool (`OrbitTool`, `SculptTool`, `BuildTool`, `MoveTokenTool`, `MeasureTool`, `LosTool`).
+ *
+ * It also builds the one `ToolContext` every tool reads. The scene's hooks are forwarded here,
+ * including the ones that reach Atlas itself: the measurements Atlas already holds, the actions
+ * that keep/change/remove them, and the selection. A hook the scene does not provide reads as
+ * "nothing there" rather than as a missing method, so a tool never has to guess.
+ *
+ * Two clears, on purpose:
+ *   - `clearPinnedMeasures()` drops what the 3D tool drew locally. The scene calls it when the
+ *     level changes; clearing Atlas' own measurements there would delete the user's work.
+ *   - `clearMeasureLevel()` clears the level in Atlas too. Destructive, and only for a Clear control.
+ */
+
+/** What a tool asks Atlas to keep. Points are world pixels; the width is in cells. */
+export interface MeasureCreatePayload {
+  shape: AtlasMeasureShape;
+  points: readonly AtlasPoint[];
+  widthCells?: number;
+  color?: string | null;
+  players?: boolean;
+  effect?: string | null;
+  follows?: string;
+  aura?: number;
+}
 
 export interface InteractionHooks {
   map(): BlockMap;
@@ -24,11 +54,29 @@ export interface InteractionHooks {
   onMeasurePinCountChange?(count: number): void;
   canMove(): boolean;
   grid(): { size: number; offsetX: number; offsetY: number; snapToGrid?: boolean } | null;
+
+  // ---- Atlas, through the scene (optional until the scene wires them) -------------------------
+  /** The rules this scene measures and moves by, as Atlas resolves them. */
+  rules?(): AtlasSceneRules;
+  /** Kept measurements and token auras of the level shown, as Atlas holds them. */
+  measures?(): readonly AtlasMeasure[];
+  selectedIds?(): readonly string[];
+  /** Logical token footprints, never the TileShare-offset drawing position. */
+  tokenTargets?(): readonly AreaTokenTarget[];
+  isPlayerView?(): boolean;
+  /** Keeps a measurement in Atlas; its id, or null at the level's cap. */
+  onAddMeasure?(payload: MeasureCreatePayload): string | null;
+  onUpdateMeasure?(id: string, changes: AtlasMeasureChanges): boolean;
+  onDeleteMeasure?(id: string): boolean;
+  /** Removes every kept measurement of the level shown. Other levels keep theirs. */
+  onClearMeasures?(): boolean;
+  onSelectMany?(ids: readonly string[]): void;
+  onMeasureTool?(updates: Record<string, unknown>): boolean;
+  onSetTokenAuras?(auras: readonly AtlasTokenAura[], look?: { color?: string | null; hidden?: boolean }): boolean;
 }
 
 /**
- * Lightweight pointer dispatcher delegating to the active tool handler
- * (`OrbitTool`, `SculptTool`, `BuildTool`, `MoveTokenTool`, `MeasureTool`, `LosTool`).
+ * Lightweight pointer dispatcher delegating to the active tool handler.
  */
 export class Interaction {
   tool: Tool = 'orbit';
@@ -42,6 +90,7 @@ export class Interaction {
   private readonly handlers: Record<Tool, ToolHandler>;
 
   constructor(private readonly view: SceneRenderer, private readonly hooks: InteractionHooks) {
+    const rules = hooks.rules;
     const ctx: ToolContext = {
       view,
       map: () => hooks.map(),
@@ -59,6 +108,22 @@ export class Interaction {
       onHover: (id, x, y) => hooks.onHover(id, x, y),
       onMoveToken: (id, x, y, floorCeiling) => hooks.onMoveToken(id, x, y, floorCeiling),
       onMeasurePinCountChange: (count) => hooks.onMeasurePinCountChange?.(count),
+
+      // A hook the scene does not provide reads as "nothing there", so a tool can call it
+      // without asking first. Rules are the exception: they are never fabricated here, and
+      // the measure tool falls back to the ones the renderer's tactical context carries.
+      ...(rules !== undefined && { rules: () => rules() }),
+      measures: () => hooks.measures?.() ?? [],
+      selectedIds: () => hooks.selectedIds?.() ?? [],
+      tokenTargets: () => hooks.tokenTargets?.() ?? [],
+      isPlayerView: () => hooks.isPlayerView?.() ?? false,
+      onAddMeasure: (payload) => hooks.onAddMeasure?.(payload) ?? null,
+      onUpdateMeasure: (id, changes) => hooks.onUpdateMeasure?.(id, changes) ?? false,
+      onDeleteMeasure: (id) => hooks.onDeleteMeasure?.(id) ?? false,
+      onClearMeasures: () => hooks.onClearMeasures?.() ?? false,
+      onSelectMany: (ids) => { hooks.onSelectMany?.(ids); },
+      onMeasureTool: (updates) => hooks.onMeasureTool?.(updates) ?? false,
+      onSetTokenAuras: (auras, look) => hooks.onSetTokenAuras?.(auras, look) ?? false,
     };
 
     this.measureTool = new MeasureTool(ctx);
@@ -96,6 +161,9 @@ export class Interaction {
     this.view.setCursor(null, this.brush, tool);
     this.view.setGhost(null);
     this.view.setMoveTarget(null);
+    // The terrain readout belongs to the gesture that was under the pointer, not to the tool
+    // that is now active; leaving it up would name a cell nothing is pointing at.
+    this.hooks.onHoverTerrain?.(null);
   }
 
   setAlt(on: boolean): void {
@@ -117,8 +185,14 @@ export class Interaction {
     this.measureTool.unpin(id);
   }
 
+  /** Drops what the 3D tool drew locally; Atlas' own measurements of the level are left alone. */
   clearPinnedMeasures(): void {
     this.measureTool.clearPinned();
+  }
+
+  /** Clears the level in Atlas too. Destructive: every kept measurement of the level shown goes. */
+  clearMeasureLevel(): void {
+    this.measureTool.clearLevel();
   }
 
   cancelActiveTool(): void {
@@ -148,8 +222,12 @@ export class Interaction {
 
   private onMove(e: PointerEvent): void {
     this.last = e;
-    const terrainPt = this.view.pickGroundOrPlane(e, 0);
-    this.hooks.onHoverTerrain?.(terrainPt ? { x: terrainPt.x, y: terrainPt.y, z: terrainPt.z } : null);
+    // One raycast per move, and only when something reads it: the terrain widget is the sole
+    // consumer, and a scene without it should not pay for the pick.
+    if (this.hooks.onHoverTerrain) {
+      const terrainPt = this.view.pickGroundOrPlane(e, 0);
+      this.hooks.onHoverTerrain(terrainPt ? { x: terrainPt.x, y: terrainPt.y, z: terrainPt.z } : null);
+    }
     this.active().onMove?.(e);
   }
 

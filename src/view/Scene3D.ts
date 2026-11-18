@@ -1,14 +1,30 @@
 import { Component, Notice, type WorkspaceLeaf } from 'obsidian';
 import * as THREE from 'three';
 import { AtlasBinding, atlasPlugin, pickAtlasLeaf, sceneStoreOf } from '../atlas/bridge';
+import { ATLAS_CHROME_SELECTORS } from '../atlas/internals';
+import {
+  formatGameUnits,
+  unitLabelFor,
+  type AtlasMeasureMode,
+  type AtlasMeasurementSettings,
+} from '../atlas/measureRules';
 import { inferDefs, resourcesOf } from '../atlas/resources';
-import type { AtlasConditionDef, AtlasGrid, AtlasResourceDef, AtlasToken, SceneSnapshot } from '../atlas/types';
+import type {
+  AtlasConditionDef,
+  AtlasGrid,
+  AtlasMeasure,
+  AtlasResourceDef,
+  AtlasToken,
+  SceneSnapshot,
+} from '../atlas/types';
 import type { PanDirection } from '../camera/CameraController';
+import { resolveColorHex } from '../common/colors';
 import type { CellNumberMode } from '../grid/cellNumbers';
 import type { GridLineType } from '../grid/gridGeometry';
 import type { GridStyle } from '../grid/GridLayer';
 import type Atlas3DPlugin from '../main';
 import { BlockMap, normalizeRotation, type BlockChange, type FacingAngle, type Rotation, type Surface } from '../terrain/blocks';
+import type { AreaTokenTarget } from '../terrain/measureGeometry';
 import type { AoEShape } from '../terrain/raycast';
 import { TokenHud, type HudCondition, type HudToken } from '../tokens/TokenHud';
 import { Interaction } from '../tools/Interaction';
@@ -19,8 +35,30 @@ import { Toolbar } from '../ui/Toolbar';
 import { SceneRenderer, type GridSpec, type Tool, type TokenSpec } from './SceneRenderer';
 import { TextureLoader } from './textures';
 
+/**
+ * One 3D map of one Atlas scene: links AtlasBinding, TerrainStore, SceneRenderer, Interaction and UI.
+ *
+ * This is the file that closes the circuit. Everything downstream of it already speaks Atlas —
+ * the rules module, the geometry, the region engine, the measure tool and the overlay — but none
+ * of it could reach Atlas until the scene handed it over. What it now provides:
+ *
+ *   - `measures()`      : the kept measurements and auras Atlas holds, so a measurement drawn
+ *                         with Atlas' own 2D tools appears here as the same figure.
+ *   - `onAddMeasure` …  : Keep writes into Atlas, the × removes it there, Clear empties the level.
+ *   - `tokenTargets()`  : tokens' LOGICAL footprints, never the TileShare-offset drawing position,
+ *                         so a diagonal counts whole cells however the art is nudged.
+ *   - `rules()`         : the collection's rules as Atlas resolves them, cached per snapshot
+ *                         because they are pulled from the asset service, not pushed by the store.
+ *   - `setMeasureContext`: the same rules, footprints, selection and speed for the tactical layer.
+ *
+ * Selection is a set, not a single id: the Select (N) button of a measured area selects every
+ * token inside it, in Atlas itself. The first of the set is what the camera and the HUD follow.
+ *
+ * Two guards (`lastAtlasMode`, `lastAtlasKeep`) keep our own writes to Atlas from being read back
+ * as changes from Atlas, which would loop.
+ */
+
 const HISTORY_LIMIT = 100;
-const DEFAULT_UNIT = 5;
 
 export interface Scene3DOptions {
   host: HTMLElement;
@@ -34,20 +72,17 @@ export interface Scene3DOptions {
 const tokenName = (token: AtlasToken): string =>
   token.name?.trim() || token.statblockName?.trim() || token.imagePath.split('/').pop()?.replace(/\.[^.]+$/, '') || 'Token';
 
-const HEX_COLOR = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i;
-const scratchColor = new THREE.Color();
-
+/**
+ * A grid line colour: 'auto'/'contrast' ask the renderer to pick by the map's luminance, anything
+ * else is resolved to '#rrggbb' by the shared colour module. The module-level scratch THREE.Color
+ * this used to keep is gone: `set` does not throw on an unknown string, it warns and leaves the
+ * colour as it was, so an invalid value returned the previous valid colour's hex.
+ */
 function normalizeColor(raw: unknown): string {
   const s = typeof raw === 'string' ? raw.trim() : '';
   const lower = s.toLowerCase();
   if (lower === 'auto' || lower === 'contrast' || lower === '') return 'contrast';
-  if (HEX_COLOR.test(s)) return s;
-  try {
-    scratchColor.set(s);
-    return `#${scratchColor.getHexString()}`;
-  } catch {
-    return '#000000';
-  }
+  return resolveColorHex(s, '#000000');
 }
 
 function normalizeOpacity(raw: unknown, fallback: number): number {
@@ -63,19 +98,6 @@ function resolveCellNumbers(raw: unknown): CellNumberMode {
   if (norm.includes('seq') || norm.includes('123') || norm === 'number' || norm === 'numbers' || norm === 'count') return 'sequential';
   if (norm.includes('col') || norm.includes('0101') || norm.includes('coord') || norm.includes('row')) return 'col-row';
   return 'a1';
-}
-
-function resolveUnitLabel(grid: AtlasGrid | null | undefined): string {
-  const custom = grid?.unitName?.trim();
-  if (custom) return custom;
-  const u = grid?.unit?.trim().toLowerCase() ?? '';
-  if (u === 'feet' || u === 'foot' || u === 'ft') return 'ft';
-  if (u === 'meters' || u === 'meter' || u === 'm') return 'm';
-  if (u === 'squares' || u === 'square' || u === 'sq') return 'sq';
-  if (u === 'units' || u === 'unit' || u === 'u' || u === '') {
-    return (grid?.unitDistanceOverride ?? grid?.unitDistance ?? 1) === 5 ? 'ft' : 'u';
-  }
-  return u;
 }
 
 function resolveGridStyle(grid: AtlasGrid): GridStyle {
@@ -113,9 +135,16 @@ function panDirectionOf(key: string): PanDirection | null {
   }
 }
 
+/**
+ * Whether the keyboard belongs to a field rather than the map. Not `instanceof HTMLElement`:
+ * that is false for an element of another window, so a popout's inputs would let shortcuts through.
+ */
 function isEditableTarget(target: EventTarget | null): boolean {
-  return target instanceof HTMLElement
-    && (target.isContentEditable || target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT');
+  if (typeof target !== 'object' || target === null) return false;
+  const el = target as { nodeType?: number; tagName?: string; isContentEditable?: boolean };
+  if (el.nodeType !== 1) return false;
+  const tag = (el.tagName ?? '').toUpperCase();
+  return el.isContentEditable === true || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
 }
 
 function isTokenDefeated(token: AtlasToken): boolean {
@@ -124,8 +153,29 @@ function isTokenDefeated(token: AtlasToken): boolean {
 }
 
 /**
- * One 3D map of one Atlas scene: links AtlasBinding, TerrainStore, SceneRenderer, Interaction and UI.
+ * The legacy four-name shape the toolbar still speaks, for an Atlas mode. `ruler` and `line` both
+ * land on 'line' because the old union has no room for both; `measure.mode` carries the real one,
+ * and the toolbar gains the six names in its own step.
  */
+function legacyShapeOf(mode: AtlasMeasureMode): AoEShape {
+  switch (mode) {
+    case 'circle': return 'sphere';
+    case 'square': return 'cube';
+    case 'cone': return 'cone';
+    default: return 'line';
+  }
+}
+
+/** The Atlas mode a legacy toolbar shape means. The old 'line' was the multi-waypoint ruler. */
+function modeOfLegacyShape(shape: AoEShape): AtlasMeasureMode {
+  switch (shape) {
+    case 'sphere': return 'circle';
+    case 'cube': return 'square';
+    case 'cone': return 'cone';
+    default: return 'ruler';
+  }
+}
+
 export class Scene3D extends Component {
   private stage!: HTMLElement;
   private renderer!: SceneRenderer;
@@ -149,11 +199,18 @@ export class Scene3D extends Component {
   private readonly tokenLoading = new Set<string>();
   private history: BlockChange[][] = [];
   private build: BuildState = { mode: 'add', shape: 'Solid', rot: 0, top: null };
-  private measure: MeasureState = { shape: 'line', keep: false };
+  private measure: MeasureState = { shape: 'line', keep: false, mode: 'ruler' };
   private measurePinCount = 0;
+  /** Every selected token; the first is the one the camera and the single-select HUD follow. */
+  private selectedIds = new Set<string>();
   private selectedId: string | null = null;
   private lastAtlasSelection: string | null = null;
   private lastAtlasTool: string | null = null;
+  /** Guards so a change we pushed to Atlas is not read back as a change from Atlas. */
+  private lastAtlasMode: AtlasMeasureMode | null = null;
+  private lastAtlasKeep: boolean | null = null;
+  /** Rules are pulled from Atlas's asset service, so they are cached per snapshot, not per frame. */
+  private rulesCache: ReturnType<AtlasBinding['sceneRules']> | null = null;
   private showGrid = true;
   private tool: Tool = 'orbit';
   private sliceLayer: number | null = null;
@@ -180,13 +237,15 @@ export class Scene3D extends Component {
       get map() { return scene.terrain; },
     });
     this.renderer.onUnpinMeasure = (id) => this.interaction.unpinMeasure(id);
+    this.renderer.onSelectTokens = (ids) => this.selectMany(ids);
 
     this.toolbar = new Toolbar(this.stage, {
       onTool: (tool) => this.setTool(tool),
       onBrush: (size) => { this.interaction.brush = size; this.toolbar.setBrush(size); },
       onMeasureShape: (shape) => this.setMeasureShape(shape),
       onMeasureKeep: () => this.toggleMeasureKeep(),
-      onMeasureClear: () => this.interaction.clearPinnedMeasures(),
+      // Clear empties the LEVEL, as Atlas's own Clear does. Local pins go with it.
+      onMeasureClear: () => this.interaction.clearMeasureLevel(),
       onPreset: (preset) => this.renderer.applyPreset(preset),
       onRotateView: (deltaDeg) => this.renderer.rotateRelative(deltaDeg),
       onCenter: () => this.centerCamera(),
@@ -240,6 +299,19 @@ export class Scene3D extends Component {
       },
       canMove: () => this.canEdit(),
       grid: () => this.snapshot?.grid ?? null,
+      // ---- Atlas, through this scene ---------------------------------------------------------
+      rules: () => this.binding.sceneRules(),
+      measures: () => this.visibleMeasures(),
+      selectedIds: () => [...this.selectedIds],
+      tokenTargets: () => this.tokenTargets(),
+      isPlayerView: () => this.snapshot?.isPlayerView === true,
+      onAddMeasure: (payload) => this.binding.addMeasure(payload),
+      onUpdateMeasure: (id, changes) => this.binding.updateMeasure(id, changes),
+      onDeleteMeasure: (id) => this.binding.deleteMeasure(id),
+      onClearMeasures: () => this.binding.clearMeasures(),
+      onSelectMany: (ids) => this.selectMany(ids),
+      onMeasureTool: (updates) => this.binding.setMeasureTool(updates),
+      onSetTokenAuras: (auras, look) => this.binding.setTokenAuras(auras, look),
     });
 
     this.buildDock.setBuild(this.build);
@@ -313,14 +385,17 @@ export class Scene3D extends Component {
     const frame = viewEl.getBoundingClientRect();
     if (frame.width === 0) return;
 
-    const startEl = viewEl.querySelector('.atlas-top-bar-start') as HTMLElement | null;
-    const endEl = viewEl.querySelector('.atlas-top-bar-end') as HTMLElement | null;
-    const levelEl = viewEl.querySelector('.atlas-level-switcher') as HTMLElement | null;
+    // The three class names are Atlas's own chrome, read from the one list the diagnostic watches:
+    // a release that renames them is reported there instead of silently moving the toolbar.
+    const [startSel, endSel, levelSel] = ATLAS_CHROME_SELECTORS;
+    const startEl = startSel ? viewEl.querySelector(startSel) as HTMLElement | null : null;
+    const endEl = endSel ? viewEl.querySelector(endSel) as HTMLElement | null : null;
+    const levelEl = levelSel ? viewEl.querySelector(levelSel) as HTMLElement | null : null;
 
     const startRect = startEl ? startEl.getBoundingClientRect() : null;
     const endRect = endEl ? endEl.getBoundingClientRect() : null;
     const leftReserve = startRect && startRect.width > 0 ? Math.max(8, Math.ceil(startRect.right - frame.left + 8)) : 8;
-    const rightReserve = endRect && endRect.width > 0 ? Math.max(8, Math.ceil(frame.right - endEl.getBoundingClientRect().left + 8)) : 8;
+    const rightReserve = endRect && endRect.width > 0 ? Math.max(8, Math.ceil(frame.right - endRect.left + 8)) : 8;
 
     const firstGroup = this.toolbar.el.firstElementChild as HTMLElement | null;
     const groupsWidth = Array.from(this.toolbar.el.children)
@@ -371,10 +446,62 @@ export class Scene3D extends Component {
     return grid !== null && grid !== undefined && grid.size > 0 && this.isSquare();
   }
 
+  /** The rules this scene measures by, cached per snapshot: they are pulled, not pushed. */
+  private rules(): AtlasMeasurementSettings {
+    return (this.rulesCache ??= this.binding.sceneRules()).measurement;
+  }
+
+  /** Distance and unit name as Atlas resolves them, for the tools that still take the pair. */
   private measureUnit(): { distance: number; label: string } {
-    const grid = this.snapshot?.grid;
-    const distance = grid?.unitDistanceOverride ?? grid?.unitDistance ?? DEFAULT_UNIT;
-    return { distance: distance > 0 ? distance : DEFAULT_UNIT, label: resolveUnitLabel(grid) };
+    const rules = this.rules();
+    return { distance: rules.unitDistance, label: unitLabelFor(rules.unitType, rules.unitName) };
+  }
+
+  /**
+   * The kept measurements the view may draw. In the Player View a GM-only measurement is not
+   * there, exactly as Atlas hides it on its own map. An aura whose token is hidden goes with it:
+   * the region engine finds no anchor for it and draws nothing.
+   */
+  private visibleMeasures(): readonly AtlasMeasure[] {
+    const snapshot = this.snapshot;
+    if (!snapshot) return [];
+    if (!snapshot.isPlayerView) return snapshot.measures;
+    return snapshot.measures.filter((measure) => measure.hidden !== true);
+  }
+
+  /**
+   * The tokens' LOGICAL footprints: their stored x/y over the grid, never the TileShare-offset
+   * position the art is drawn at. A diagonal must count whole cells even when two tokens share
+   * a cell and the drawing nudges them apart.
+   */
+  private tokenTargets(): AreaTokenTarget[] {
+    const size = this.snapshot?.grid?.size ?? 0;
+    if (!(size > 0)) return [];
+    const out: AreaTokenTarget[] = [];
+    for (const token of this.tokensById.values()) {
+      out.push({
+        id: token.id,
+        x: token.x / size,
+        z: token.y / size,
+        diameter: 2 * (token.size ?? 1) - 1,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Feeds the tactical layer what it needs to measure as Atlas does: the collection's rules, the
+   * logical footprints, the selection, and the speed of the token the ranges would be drawn around.
+   */
+  private syncMeasureContext(): void {
+    const rules = this.rulesCache ??= this.binding.sceneRules();
+    this.renderer.setMeasureContext({
+      rules: rules.measurement,
+      movement: rules.movement,
+      tokens: this.tokenTargets(),
+      selectedIds: [...this.selectedIds],
+      speed: this.selectedId !== null ? this.binding.tokenSpeed(this.selectedId) : null,
+    });
   }
 
   private onScene(snapshot: SceneSnapshot): void {
@@ -383,10 +510,14 @@ export class Scene3D extends Component {
       this.toolbar.say('Waiting for Atlas to load the scene…', this.tool);
       return;
     }
+    this.rulesCache = this.binding.sceneRules();
+
     const key = snapshot.levelId ? `${snapshot.mapPath}::${snapshot.levelId}` : snapshot.mapPath;
     const sceneChanged = key !== this.sceneKey;
     if (sceneChanged) {
       this.clearHover();
+      // Only what the 3D tool drew locally. Clearing Atlas's own measurements here would
+      // delete the user's work every time they changed level.
       this.interaction.clearPinnedMeasures();
       void this.switchScene(key);
     }
@@ -398,19 +529,36 @@ export class Scene3D extends Component {
       this.setTool('orbit');
     }
 
-    // Sync Measure tool & shape with Atlas VTT's Measure (M) when exposed
+    // Sync the active tool with Atlas's own, once per change so our own writes do not loop.
     if (snapshot.activeTool !== this.lastAtlasTool) {
       this.lastAtlasTool = snapshot.activeTool;
       if (snapshot.activeTool === 'measure' && this.tool !== 'measure') this.setTool('measure');
       else if (this.tool === 'measure' && snapshot.activeTool !== null && snapshot.activeTool !== 'measure') this.setTool('orbit');
     }
-    if (snapshot.measureMode !== null && snapshot.measureMode !== this.measure.shape) {
-      this.setMeasureShape(snapshot.measureMode);
+    if (snapshot.measureMode !== null && snapshot.measureMode !== this.lastAtlasMode) {
+      this.lastAtlasMode = snapshot.measureMode;
+      if (snapshot.measureMode !== this.measure.mode) {
+        this.measure = { ...this.measure, mode: snapshot.measureMode, shape: legacyShapeOf(snapshot.measureMode) };
+        this.toolbar.setMeasureState(this.measure, this.measurePinCount);
+        this.interaction.refreshTactical();
+      }
     }
-    if (snapshot.measureKeep !== null && snapshot.measureKeep !== this.measure.keep) {
-      this.measure = { ...this.measure, keep: snapshot.measureKeep };
-      this.toolbar.setMeasureState(this.measure, this.measurePinCount);
+    if (snapshot.measureKeep !== null && snapshot.measureKeep !== this.lastAtlasKeep) {
+      this.lastAtlasKeep = snapshot.measureKeep;
+      if (snapshot.measureKeep !== this.measure.keep) {
+        this.measure = { ...this.measure, keep: snapshot.measureKeep };
+        this.toolbar.setMeasureState(this.measure, this.measurePinCount);
+      }
     }
+
+    // The Look Atlas holds. No control draws them yet; the tool reads them when it creates a measure.
+    this.measure = {
+      ...this.measure,
+      players: snapshot.measurePlayers ?? this.measure.players,
+      color: snapshot.measureColor,
+      effect: snapshot.measureEffect,
+      lineWidth: snapshot.measureLineWidth ?? this.measure.lineWidth,
+    };
 
     this.toolbar.say(this.warning(snapshot), this.tool);
 
@@ -423,14 +571,22 @@ export class Scene3D extends Component {
     this.defs = this.binding.resourceDefs() ?? inferDefs(visibleTokens);
     this.conditionDefs = new Map((this.binding.conditionDefs() ?? []).map((c) => [c.id, c]));
 
-    const atlasSelection = snapshot.selectedIds[0] ?? null;
+    const atlasSelection = snapshot.selectedIds.join('|');
     if (atlasSelection !== this.lastAtlasSelection) {
       this.lastAtlasSelection = atlasSelection;
-      if (atlasSelection !== null) this.selectedId = atlasSelection;
+      this.selectedIds = new Set(snapshot.selectedIds.filter((id) => this.tokensById.has(id)));
+      this.selectedId = [...this.selectedIds][0] ?? null;
     }
-    if (this.selectedId !== null && !this.tokensById.has(this.selectedId)) this.selectedId = null;
+    for (const id of [...this.selectedIds]) {
+      if (!this.tokensById.has(id)) this.selectedIds.delete(id);
+    }
+    if (this.selectedId !== null && !this.tokensById.has(this.selectedId)) {
+      this.selectedId = [...this.selectedIds][0] ?? null;
+    }
+
     this.applyGrid();
     this.applyTokens();
+    this.syncMeasureContext();
     this.interaction.refreshTactical();
     if (this.opts.embedded) this.scheduleSafeAreaSync();
   }
@@ -457,6 +613,7 @@ export class Scene3D extends Component {
     this.renderer.rebuildTerrain();
     this.syncTerrainUi();
     this.applyTokens();
+    this.syncMeasureContext();
     this.interaction.refreshTactical();
   }
 
@@ -495,7 +652,7 @@ export class Scene3D extends Component {
     const snapshot = this.snapshot;
     const grid = snapshot?.grid;
     if (!snapshot || !grid) return;
-    const unit = grid.unitDistanceOverride ?? grid.unitDistance ?? DEFAULT_UNIT;
+    const unit = this.rules().unitDistance;
     const specs: TokenSpec[] = [...this.tokensById.values()].map((token) => {
       const meta = this.terrain.getTokenMeta(token.id);
       return {
@@ -513,7 +670,7 @@ export class Scene3D extends Component {
         showRing: token.showRing !== false,
         hidden: token.isHidden === true,
         defeated: isTokenDefeated(token),
-        selected: token.id === this.selectedId,
+        selected: this.selectedIds.has(token.id),
       };
     });
     this.renderer.setTokens(specs);
@@ -574,6 +731,7 @@ export class Scene3D extends Component {
     this.sliceLayer = layer;
     this.renderer.setMaxLayer(layer);
     this.syncTerrainUi();
+    this.syncMeasureContext();
     this.interaction.refreshTactical();
   }
 
@@ -590,11 +748,7 @@ export class Scene3D extends Component {
       this.interaction.cancelActiveTool();
       return;
     }
-    if (event.code === 'Space' && this.tool === 'measure' && this.interaction.addMeasureWaypoint()) {
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
+    // No Space: Atlas owns it. Waypoints are Shift+click, which the measure tool already handles.
     if (command && !event.shiftKey && key === 'z') {
       if (this.history.length === 0) return;
       event.preventDefault();
@@ -619,6 +773,13 @@ export class Scene3D extends Component {
         this.centerCamera();
         return;
       }
+      // Alt+R turns the piece: bare R is Atlas's.
+      if (key === 'r' && this.tool === 'build') {
+        event.preventDefault();
+        event.stopPropagation();
+        this.turnPiece(event.shiftKey ? -1 : 1);
+        return;
+      }
     }
     if (command || event.altKey) return;
 
@@ -638,12 +799,6 @@ export class Scene3D extends Component {
       event.preventDefault();
       event.stopPropagation();
       this.stepSlice(key === 'pageup' ? 1 : -1);
-      return;
-    }
-    if (key === 'r' && this.tool === 'build') {
-      event.preventDefault();
-      event.stopPropagation();
-      this.turnPiece(event.shiftKey ? -1 : 1);
       return;
     }
     const pan = panDirectionOf(event.key);
@@ -677,15 +832,22 @@ export class Scene3D extends Component {
     if (this.opts.embedded) this.scheduleSafeAreaSync();
   }
 
+  /** A shape chosen in the 3D toolbar; pushed to Atlas so its own Measure bar follows. */
   private setMeasureShape(shape: AoEShape): void {
-    this.measure = { ...this.measure, shape };
+    const mode = modeOfLegacyShape(shape);
+    this.measure = { ...this.measure, shape, mode };
+    this.lastAtlasMode = mode;
     this.toolbar.setMeasureState(this.measure, this.measurePinCount);
+    this.binding.setMeasureTool({ mode });
     this.interaction.refreshTactical();
   }
 
   private toggleMeasureKeep(): void {
-    this.measure = { ...this.measure, keep: !this.measure.keep };
+    const keep = !this.measure.keep;
+    this.measure = { ...this.measure, keep };
+    this.lastAtlasKeep = keep;
     this.toolbar.setMeasureState(this.measure, this.measurePinCount);
+    this.binding.setMeasureTool({ keep });
   }
 
   private recordStroke(changes: BlockChange[]): void {
@@ -702,6 +864,7 @@ export class Scene3D extends Component {
     for (const c of changes) this.renderer.touchCell(c.x, c.z);
     this.saveTerrain();
     this.syncTerrainUi();
+    this.syncMeasureContext();
     this.interaction.refreshTactical();
   }
 
@@ -728,6 +891,7 @@ export class Scene3D extends Component {
     this.saveTerrain();
     this.renderer.rebuildTerrain();
     this.syncTerrainUi();
+    this.syncMeasureContext();
     this.interaction.refreshTactical();
   }
 
@@ -758,9 +922,8 @@ export class Scene3D extends Component {
 
   private stepTokenElevation(id: string, delta: number): void {
     const token = this.tokensById.get(id);
-    const grid = this.snapshot?.grid;
-    if (!token || !grid) return;
-    const step = grid.unitDistanceOverride ?? grid.unitDistance ?? DEFAULT_UNIT;
+    if (!token) return;
+    const step = this.rules().unitDistance;
     const next = Math.max(0, (token.elevation ?? 0) + delta * step);
     this.binding.setTokenElevation(id, next);
   }
@@ -791,7 +954,7 @@ export class Scene3D extends Component {
       this.terrainInfo.update(null);
       return;
     }
-    const unit = this.measureUnit();
+    const rules = this.rules();
     this.terrainInfo.update({
       cx,
       cz,
@@ -799,8 +962,8 @@ export class Scene3D extends Component {
       map: this.terrain,
       layout,
       cellNumberMode: resolveCellNumbers(grid.cellNumbers),
-      unitDistance: unit.distance,
-      unitLabel: unit.label,
+      unitDistance: rules.unitDistance,
+      unitLabel: unitLabelFor(rules.unitType, rules.unitName),
       ceilingY: this.renderer.currentCeilingY(),
     });
   }
@@ -808,17 +971,32 @@ export class Scene3D extends Component {
   // ---- tokens: selection, menu, resources, statblock ----------------------------------------------
 
   private select(id: string | null): void {
+    this.selectedIds = id === null ? new Set() : new Set([id]);
     this.selectedId = id;
-    this.lastAtlasSelection = id;
+    this.lastAtlasSelection = id ?? '';
     this.binding.select(id === null ? [] : [id]);
     this.applyTokens();
+    this.syncMeasureContext();
+    this.interaction.refreshTactical();
+  }
+
+  /** The Select (N) button of a measured area: Atlas's own selection takes every token inside. */
+  private selectMany(ids: readonly string[]): void {
+    const kept = ids.filter((id) => this.tokensById.has(id));
+    this.selectedIds = new Set(kept);
+    this.selectedId = kept[0] ?? null;
+    this.lastAtlasSelection = kept.join('|');
+    this.binding.select(kept);
+    this.applyTokens();
+    this.syncMeasureContext();
+    this.interaction.refreshTactical();
   }
 
   private contextMenu(id: string, x: number, y: number): void {
     this.select(id);
     if (this.binding.openContextMenu(id, x, y) || this.warnedMenu) return;
     this.warnedMenu = true;
-    new Notice('Atlas VTT\'s token menu cannot be reached from the 3D map in this version of Atlas.');
+    new Notice("Atlas VTT's token menu cannot be reached from the 3D map in this version of Atlas.");
   }
 
   private hover(id: string | null, clientX: number, clientY: number): void {
@@ -849,22 +1027,22 @@ export class Scene3D extends Component {
   }
 
   private refreshHud(): void {
-    const grid = this.snapshot?.grid;
-    const unitName = resolveUnitLabel(grid);
+    const rules = this.rules();
     const ts = this.snapshot?.tokenSettings;
     const items: HudToken[] = [];
 
     for (const point of this.renderer.screenPoints()) {
       const token = this.tokensById.get(point.id);
       if (!token) continue;
-      const selected = token.id === this.selectedId;
+      const selected = this.selectedIds.has(token.id);
       const shown = resourcesOf(token, this.defs);
       const bars = selected
         ? shown.bars
         : shown.bars.filter((_, i) => (i === 0 ? ts?.showHpBars !== false : ts?.showSecondaryResourceBars !== false));
 
       const elev = token.elevation ?? 0;
-      const elevationText = elev > 0 ? `+${elev} ${unitName}` : `0 ${unitName}`;
+      // Atlas writes the unit right after the number ("25ft"), a typed name after a space.
+      const elevationText = elev > 0 ? `+${formatGameUnits(elev, rules)}` : formatGameUnits(0, rules);
       const meta = this.terrain.getTokenMeta(token.id);
 
       items.push({

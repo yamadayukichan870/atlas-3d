@@ -1,24 +1,30 @@
 /**
  * The geometry of a measured area, and which terrain cells and tokens it covers.
  *
- * REWORK. The previous engine decided coverage by clipping the area's polygon against every
- * cell (Sutherland–Hodgman, convexity detection, fan triangulation for wide cones). That chain
- * was fragile: a cone whose convexity test failed on floating-point noise fell into the fan
- * path and returned an inflated area, so the fill spilled past the outline.
+ * COVERAGE IS ATLAS' EXACT CLIP, not a sample grid. The previous engine decided a cell by
+ * sampling its centre/corners on a 5x5 lattice; that quantises the covered fraction to 1/25 and
+ * over-includes boundary cells (a 5-cell circle came out 8 cells fat), so the floor marking
+ * disagreed with the shape Atlas draws. Atlas instead marks only the cells the outline TOUCHES
+ * and clips those exactly; a cell the outline does not touch is wholly in or wholly out and is
+ * decided by one centre test. That is both correct and cheap.
  *
- * This engine decides coverage with ONE closed-form predicate per shape, `contains(point)`,
- * and samples it over each cell. No polygon clipping, no winding, no convexity: there is no
- * machinery left that can inflate an area. The outline is still drawn from the analytic ring,
- * so fill and border come from the same definition and cannot disagree.
+ * The clip direction matters: the AREA ring is the subject and the CELL rectangle is the convex
+ * clip (Sutherland–Hodman). Clipping the other way round is invalid for a reflex ring — a cone
+ * opening more than half a turn — which is exactly where the old fan-triangulation inflated.
+ * Signed areas of all rings are summed and abs'd at the end, so winding never matters and a
+ * hole (a wall-cut ring) subtracts.
  *
- * It is not Atlas' exact half-cell clip — a 5x5 sample estimates the covered fraction instead —
- * but it is robust and predictable, which is the point of the rework. `centre` is exact (one
- * test); `half` and `any` use the sample grid. Shapes keep Atlas' anchoring (a square is a box
- * from the middle of its near side, a cone opens the collection's angle).
+ * `half` counts a cell at half its own area (minus a share tolerance so an exact half counts);
+ * `any` at any positive overlap; `centre` by the middle alone. A rectangle the map cuts short is
+ * judged by its own area, so half a cell at the map edge is still half of what is there.
  *
- * World convention: x/z are the plan, y is up, one grid cell spans one world unit. Areas are
- * plan figures projected onto every exposed terrain surface under the slice. A sphere is kept
- * apart (`cellsInSphere`) as the alternative to the plan circle.
+ * Shapes keep Atlas' anchoring: a square is a box from the middle of its near side, a line is a
+ * rectangle as long as the drag and its width wide plus a spine that forces every cell its
+ * middle line crosses, a cone opens the collection's angle with a round or flat end.
+ *
+ * World convention: x/z the plan, y up, one grid cell spans one world unit. Areas are plan
+ * figures projected onto every exposed terrain surface under the slice, so one area can cover a
+ * floor and a balcony above it. A sphere is kept apart (`cellsInSphere`) as the 3D alternative.
  *
  * Pure: no three.js, no DOM. Tested in Node.
  */
@@ -43,10 +49,6 @@ export interface PlanPoint { readonly x: number; readonly z: number }
 export type PlanRing = readonly PlanPoint[];
 export interface PlanCell { readonly cx: number; readonly cz: number }
 
-/**
- * An area as its measurement shapes it. `contains` is the closed-form test coverage samples;
- * `rings` is the analytic boundary the overlay draws. Both come from the same parameters.
- */
 export interface PlanArea {
   readonly shape: Exclude<AtlasMeasureShape, 'ruler'>;
   readonly origin: PlanPoint;
@@ -83,15 +85,30 @@ const MAX_AREA_CELLS = 65_536;
 const CURVE_SAGITTA = 0.005;
 const MIN_CURVE_SEGMENTS = 32;
 const MAX_CURVE_SEGMENTS = 128;
-/** Side of the sample grid a cell is judged by for `half`/`any`. Odd, so it has a centre. */
-const SAMPLES = 5;
+/** An overlap below this is nothing. */
+const AREA_EPSILON = 1e-9;
+/** How far below an exact half a cell still counts as half, as a share of its area. */
+const SHARE_TOLERANCE = 1e-9;
+/** The circumradius of a unit cell: a centre this close to an edge means the outline touches it. */
+const CELL_CIRCUMRADIUS = Math.SQRT1_2;
 const heightKey = (y: number): number => Math.round(y * 10000);
 const cellKey = (cx: number, cz: number): string => `${cx},${cz}`;
+const cornerKey = (p: PlanPoint): string => `${Math.round(p.x * 1e6)},${Math.round(p.z * 1e6)}`;
 
 const sub = (a: PlanPoint, b: PlanPoint): PlanPoint => ({ x: a.x - b.x, z: a.z - b.z });
 const dot = (a: PlanPoint, b: PlanPoint): number => a.x * b.x + a.z * b.z;
 const cross = (a: PlanPoint, b: PlanPoint): number => a.x * b.z - a.z * b.x;
 const norm = (a: PlanPoint): number => Math.hypot(a.x, a.z);
+
+function signedArea(ring: readonly PlanPoint[]): number {
+  let sum = 0;
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i]!;
+    const b = ring[(i + 1) % ring.length]!;
+    sum += a.x * b.z - b.x * a.z;
+  }
+  return sum / 2;
+}
 
 function ringBounds(rings: readonly PlanRing[]): { x0: number; x1: number; z0: number; z1: number } {
   let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
@@ -104,6 +121,10 @@ function ringBounds(rings: readonly PlanRing[]): { x0: number; x1: number; z0: n
   return { x0, x1, z0, z1 };
 }
 
+function rectRing(x0: number, z0: number, x1: number, z1: number): PlanPoint[] {
+  return [{ x: x0, z: z0 }, { x: x1, z: z0 }, { x: x1, z: z1 }, { x: x0, z: z1 }];
+}
+
 function curveSegments(radius: number, turnFraction: number): number {
   if (!(radius > CURVE_SAGITTA)) return MIN_CURVE_SEGMENTS;
   const ratio = Math.min(1, Math.max(-1, 1 - CURVE_SAGITTA / radius));
@@ -112,15 +133,19 @@ function curveSegments(radius: number, turnFraction: number): number {
   return Math.min(MAX_CURVE_SEGMENTS, Math.max(MIN_CURVE_SEGMENTS, wanted));
 }
 
+/** Distance from a point to a segment, for deciding which cells the outline touches. */
+function distToSegment(p: PlanPoint, a: PlanPoint, b: PlanPoint): number {
+  const dx = b.x - a.x, dz = b.z - a.z;
+  const l2 = dx * dx + dz * dz;
+  const t = l2 === 0 ? 0 : Math.min(1, Math.max(0, ((p.x - a.x) * dx + (p.z - a.z) * dz) / l2));
+  return Math.hypot(p.x - (a.x + dx * t), p.z - (a.z + dz * t));
+}
+
 // ---------------------------------------------------------------------------
 // The shapes: analytic predicate + outline ring, from the same parameters
 // ---------------------------------------------------------------------------
 function boxArea(
-  shape: 'square' | 'line',
-  origin: PlanPoint,
-  towards: PlanPoint,
-  length: number,
-  halfWidth: number,
+  shape: 'square' | 'line', origin: PlanPoint, towards: PlanPoint, length: number, halfWidth: number,
 ): PlanArea | null {
   if (!(halfWidth > 0) || !Number.isFinite(halfWidth)) return null;
   const side: PlanPoint = { x: -towards.z * halfWidth, z: towards.x * halfWidth };
@@ -132,9 +157,7 @@ function boxArea(
     { x: far.x - side.x, z: far.z - side.z },
   ];
   return {
-    shape, origin, towards, length,
-    reach: Math.hypot(length, halfWidth),
-    rings: [ring],
+    shape, origin, towards, length, reach: Math.hypot(length, halfWidth), rings: [ring],
     contains: (p) => {
       const v = sub(p, origin);
       const along = dot(v, towards);
@@ -144,12 +167,7 @@ function boxArea(
   };
 }
 
-function circleArea(
-  shape: 'circle' | 'cone',
-  origin: PlanPoint,
-  towards: PlanPoint,
-  radius: number,
-): PlanArea {
+function circleArea(shape: 'circle' | 'cone', origin: PlanPoint, towards: PlanPoint, radius: number): PlanArea {
   const segments = curveSegments(radius, 1);
   const ring: PlanPoint[] = [];
   for (let i = 0; i < segments; i++) {
@@ -163,11 +181,7 @@ function circleArea(
 }
 
 function coneArea(
-  origin: PlanPoint,
-  towards: PlanPoint,
-  length: number,
-  angle: number,
-  end: AtlasAreaShapeRules['coneEnd'],
+  origin: PlanPoint, towards: PlanPoint, length: number, angle: number, end: AtlasAreaShapeRules['coneEnd'],
 ): PlanArea {
   if (!(angle > 0) || angle >= 360) return circleArea('cone', origin, towards, length);
   const half = (angle * Math.PI) / 360;
@@ -203,79 +217,111 @@ function coneArea(
 }
 
 export function shapedArea(
-  shape: AtlasMeasureShape,
-  origin: PlanPoint,
-  end: PlanPoint,
-  rules: AtlasAreaShapeRules,
-  lineWidthCells?: number,
+  shape: AtlasMeasureShape, origin: PlanPoint, end: PlanPoint,
+  rules: AtlasAreaShapeRules, lineWidthCells?: number,
 ): PlanArea | null {
   if (shape === 'ruler') return null;
   if (!Number.isFinite(origin.x) || !Number.isFinite(origin.z)) return null;
-  const dx = end.x - origin.x;
-  const dz = end.z - origin.z;
+  const dx = end.x - origin.x, dz = end.z - origin.z;
   const length = Math.hypot(dx, dz);
   if (!(length > 0) || !Number.isFinite(length)) return null;
   const towards: PlanPoint = { x: dx / length, z: dz / length };
   switch (shape) {
-    case 'circle':
-      return circleArea('circle', origin, towards, length);
-    case 'cone':
-      return coneArea(origin, towards, length, rules.coneAngle, rules.coneEnd);
-    case 'square':
-      return boxArea('square', origin, towards, length, length / 2);
+    case 'circle': return circleArea('circle', origin, towards, length);
+    case 'cone': return coneArea(origin, towards, length, rules.coneAngle, rules.coneEnd);
+    case 'square': return boxArea('square', origin, towards, length, length / 2);
     case 'line': {
       const width = lineWidthCells !== undefined && Number.isFinite(lineWidthCells) && lineWidthCells > 0
         ? lineWidthCells : rules.lineWidthCells;
       const line = boxArea('line', origin, towards, length, width / 2);
-      return line && {
-        ...line,
-        spine: [origin, { x: origin.x + towards.x * length, z: origin.z + towards.z * length }],
-      };
+      return line && { ...line, spine: [origin, { x: origin.x + towards.x * length, z: origin.z + towards.z * length }] };
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Coverage by sampling the analytic predicate
+// Exact clipping: the area ring is the subject, the cell rectangle the convex clip
 // ---------------------------------------------------------------------------
-/** The share of a rectangle's sample grid that lies in the area. */
-function sampledFraction(
-  area: PlanArea,
-  x0: number, z0: number, x1: number, z1: number,
-): number {
-  let inside = 0;
-  const n = SAMPLES;
-  for (let i = 0; i < n; i++) {
-    const x = x0 + ((i + 0.5) / n) * (x1 - x0);
-    for (let j = 0; j < n; j++) {
-      const z = z0 + ((j + 0.5) / n) * (z1 - z0);
-      if (area.contains({ x, z })) inside++;
+function clipToConvex(subject: readonly PlanPoint[], clip: PlanRing): PlanPoint[] {
+  let out = [...subject];
+  for (let i = 0; i < clip.length && out.length > 0; i++) {
+    const a = clip[i]!;
+    const b = clip[(i + 1) % clip.length]!;
+    const ex = b.x - a.x, ez = b.z - a.z;
+    const side = (p: PlanPoint): number => ex * (p.z - a.z) - ez * (p.x - a.x);
+    const input = out;
+    out = [];
+    for (let j = 0; j < input.length; j++) {
+      const cur = input[j]!;
+      const prev = input[(j + input.length - 1) % input.length]!;
+      const sc = side(cur), sp = side(prev);
+      const curIn = sc >= -AREA_EPSILON, prevIn = sp >= -AREA_EPSILON;
+      if (curIn) {
+        if (!prevIn) {
+          const t = sp / (sp - sc);
+          out.push({ x: prev.x + (cur.x - prev.x) * t, z: prev.z + (cur.z - prev.z) * t });
+        }
+        out.push(cur);
+      } else if (prevIn) {
+        const t = sp / (sp - sc);
+        out.push({ x: prev.x + (cur.x - prev.x) * t, z: prev.z + (cur.z - prev.z) * t });
+      }
     }
   }
-  return inside / (n * n);
+  return out;
 }
 
-/**
- * Whether a rectangle is covered under the rule. `centre` is one exact test. `half`/`any`
- * fast-path a rectangle wholly in or out by its corners and centre, and sample only the border.
- */
+/** Signed overlap of one ring with a rectangle; the cell is the convex clip, so reflex rings work. */
+function ringOverlap(ring: PlanRing, rect: PlanRing): number {
+  const piece = clipToConvex(ring, rect);
+  return piece.length >= 3 ? signedArea(piece) : 0;
+}
+
+/** Overlap of the whole area with a rectangle: rings summed signed, abs at the end. */
+function areaOverlap(area: PlanArea, rect: PlanRing): number {
+  let sum = 0;
+  for (const ring of area.rings) sum += ringOverlap(ring, rect);
+  return Math.abs(sum);
+}
+
+/** The cells whose centre lies within a cell's circumradius of some outline edge: the touched set. */
+function touchedCells(
+  area: PlanArea, cx0: number, cx1: number, cz0: number, cz1: number, layout: Layout,
+): Set<string> {
+  const out = new Set<string>();
+  const m = CELL_CIRCUMRADIUS;
+  for (const ring of area.rings) {
+    for (let i = 0; i < ring.length; i++) {
+      const a = ring[i]!, b = ring[(i + 1) % ring.length]!;
+      const ex0 = Math.max(cx0, Math.floor(Math.min(a.x, b.x) - m - layout.originX));
+      const ex1 = Math.min(cx1, Math.ceil(Math.max(a.x, b.x) + m - layout.originX) - 1);
+      const ez0 = Math.max(cz0, Math.floor(Math.min(a.z, b.z) - m - layout.originZ));
+      const ez1 = Math.min(cz1, Math.ceil(Math.max(a.z, b.z) + m - layout.originZ) - 1);
+      for (let cz = ez0; cz <= ez1; cz++) {
+        for (let cx = ex0; cx <= ex1; cx++) {
+          const centre: PlanPoint = { x: layout.originX + cx + 0.5, z: layout.originZ + cz + 0.5 };
+          if (distToSegment(centre, a, b) <= m) out.add(cellKey(cx, cz));
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** Whether a rectangle is covered under the rule, exactly. */
 function rectCovered(
-  area: PlanArea,
-  x0: number, z0: number, x1: number, z1: number,
-  rule: AtlasCellRule,
+  area: PlanArea, rect: PlanRing, x0: number, z0: number, x1: number, z1: number,
+  rule: AtlasCellRule, touched: boolean,
 ): boolean {
-  const cx = (x0 + x1) / 2;
-  const cz = (z0 + z1) / 2;
+  const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
   if (rule === 'centre') return area.contains({ x: cx, z: cz });
-  const corners = [
-    area.contains({ x: x0, z: z0 }), area.contains({ x: x1, z: z0 }),
-    area.contains({ x: x1, z: z1 }), area.contains({ x: x0, z: z1 }),
-  ];
-  const centre = area.contains({ x: cx, z: cz });
-  if (corners.every(Boolean) && centre) return true;
-  if (corners.every((c) => !c) && !centre) return false;
-  const fraction = sampledFraction(area, x0, z0, x1, z1);
-  return rule === 'any' ? fraction > 0 : fraction >= 0.5;
+  // A cell the outline does not touch is wholly in or out: one centre test decides it.
+  if (!touched) return area.contains({ x: cx, z: cz });
+  const whole = (x1 - x0) * (z1 - z0);
+  if (!(whole > 0)) return false;
+  const overlap = areaOverlap(area, rect);
+  if (rule === 'any') return overlap > AREA_EPSILON;
+  return overlap >= whole * (0.5 - SHARE_TOLERANCE);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,25 +406,25 @@ export function cellsInArea(area: PlanArea, options: AreaCellOptions): AreaCell[
   const cz1 = Math.min(layout.range.cz1, Math.ceil(bounds.z1 - layout.originZ + EDGE_TOLERANCE) - 1);
   if (cx1 < cx0 || cz1 < cz0) return [];
   if ((cx1 - cx0 + 1) * (cz1 - cz0 + 1) > MAX_AREA_CELLS) return [];
-
   const flatAt = createColumnFlatSampler(map, layout, maxLayer);
+  const touched = rule === 'centre' ? new Set<string>() : touchedCells(area, cx0, cx1, cz0, cz1, layout);
   const out: AreaCell[] = [];
   const taken = new Set<string>();
   const cover = (cx: number, cz: number, forced: boolean): void => {
     for (const surface of surfacesOfColumn(cx, cz, map, layout, maxLayer, flatAt)) {
-      const width = surface.x1 - surface.x0;
-      const depth = surface.z1 - surface.z0;
+      const width = surface.x1 - surface.x0, depth = surface.z1 - surface.z0;
       if (!(width > 0) || !(depth > 0)) continue;
-      if (!forced && !rectCovered(area, surface.x0, surface.z0, surface.x1, surface.z1, rule)) continue;
-      const midX = (surface.x0 + surface.x1) / 2;
-      const midZ = (surface.z0 + surface.z1) / 2;
+      if (!forced && !rectCovered(
+        area, rectRing(surface.x0, surface.z0, surface.x1, surface.z1),
+        surface.x0, surface.z0, surface.x1, surface.z1, rule, touched.has(cellKey(cx, cz)),
+      )) continue;
+      const midX = (surface.x0 + surface.x1) / 2, midZ = (surface.z0 + surface.z1) / 2;
       const y = surface.heightAt(midX, midZ);
       const key = `${cellKey(cx, cz)}@${heightKey(y)}`;
       if (taken.has(key)) continue;
       taken.add(key);
       out.push({
-        cx, cz, y,
-        x0: surface.x0, x1: surface.x1, z0: surface.z0, z1: surface.z1,
+        cx, cz, y, x0: surface.x0, x1: surface.x1, z0: surface.z0, z1: surface.z1,
         ...(surface.slope !== undefined && { slope: surface.slope }),
       });
     }
@@ -397,8 +443,7 @@ export function cellsInArea(area: PlanArea, options: AreaCellOptions): AreaCell[
 
 export function cellsInSphere(
   centre: { readonly x: number; readonly y: number; readonly z: number },
-  radius: number,
-  options: AreaCellOptions,
+  radius: number, options: AreaCellOptions,
 ): AreaCell[] {
   if (!(radius > 0) || !Number.isFinite(radius)) return [];
   const { map, layout } = options;
@@ -415,13 +460,11 @@ export function cellsInSphere(
   for (let cz = cz0; cz <= cz1; cz++) {
     for (let cx = cx0; cx <= cx1; cx++) {
       for (const surface of surfacesOfColumn(cx, cz, map, layout, maxLayer, flatAt)) {
-        const midX = (surface.x0 + surface.x1) / 2;
-        const midZ = (surface.z0 + surface.z1) / 2;
+        const midX = (surface.x0 + surface.x1) / 2, midZ = (surface.z0 + surface.z1) / 2;
         const y = surface.heightAt(midX, midZ);
         if (Math.hypot(midX - centre.x, y - centre.y, midZ - centre.z) > reach) continue;
         out.push({
-          cx, cz, y,
-          x0: surface.x0, x1: surface.x1, z0: surface.z0, z1: surface.z1,
+          cx, cz, y, x0: surface.x0, x1: surface.x1, z0: surface.z0, z1: surface.z1,
           ...(surface.slope !== undefined && { slope: surface.slope }),
         });
       }
@@ -444,25 +487,23 @@ export function stoodCells(x: number, z: number, diameter: number, layout: Layou
   return out;
 }
 
-/** A token counts when its footprint touches the area, sampled the same way a cell is. */
+/** A token counts when its footprint touches the area, by the same exact clip a cell uses. */
 export function tokensInArea(area: PlanArea, tokens: readonly AreaTokenTarget[]): string[] {
   const out: string[] = [];
   for (const token of tokens) {
     const half = Math.max(1, token.diameter) / 2;
     const x0 = token.x - half, x1 = token.x + half, z0 = token.z - half, z1 = token.z + half;
-    if (rectCovered(area, x0, z0, x1, z1, 'any')) out.push(token.id);
+    const rect = rectRing(x0, z0, x1, z1);
+    if (rect.every((c) => area.contains(c)) || areaOverlap(area, rect) > AREA_EPSILON) out.push(token.id);
   }
   return out;
 }
 
 // ---------------------------------------------------------------------------
-// Cells within a reach: ranges and auras (unchanged, already cell-first)
+// Cells within a reach: ranges and auras
 // ---------------------------------------------------------------------------
 export function cellsWithinReach(
-  stood: readonly PlanCell[],
-  reach: number,
-  rule: AtlasDiagonalRule,
-  layout: Layout,
+  stood: readonly PlanCell[], reach: number, rule: AtlasDiagonalRule, layout: Layout,
 ): PlanCell[] | null {
   if (stood.length === 0 || !(reach >= 0) || !Number.isFinite(reach)) return null;
   const span = Math.ceil(reach + EDGE_TOLERANCE);
@@ -484,10 +525,8 @@ export function cellsWithinReach(
     for (let cx = cx0; cx <= cx1; cx++) {
       let nearest = Infinity;
       for (const cell of stood) {
-        const dx = Math.abs(cx - cell.cx);
-        const dz = Math.abs(cz - cell.cz);
-        const straight = Math.abs(dx - dz);
-        const diagonal = Math.min(dx, dz);
+        const dx = Math.abs(cx - cell.cx), dz = Math.abs(cz - cell.cz);
+        const straight = Math.abs(dx - dz), diagonal = Math.min(dx, dz);
         const cost = cellsByRule({ straight, diagonal, euclidean: Math.hypot(dx, dz) }, rule, 0);
         if (cost < nearest) nearest = cost;
         if (nearest <= EDGE_TOLERANCE) break;
@@ -502,7 +541,6 @@ export function outlineOfCells(cells: readonly PlanCell[], layout: Layout): Plan
   if (cells.length === 0) return [];
   const held = new Set(cells.map((c) => cellKey(c.cx, c.cz)));
   interface Edge { from: PlanPoint; to: PlanPoint; used: boolean }
-  const cornerKey = (p: PlanPoint): string => `${Math.round(p.x * 1e6)},${Math.round(p.z * 1e6)}`;
   const leaving = new Map<string, Edge[]>();
   const add = (from: PlanPoint, to: PlanPoint): void => {
     const key = cornerKey(from);

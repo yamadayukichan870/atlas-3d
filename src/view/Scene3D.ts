@@ -3,6 +3,8 @@ import * as THREE from 'three';
 import { AtlasBinding, atlasPlugin, pickAtlasLeaf, sceneStoreOf } from '../atlas/bridge';
 import { ATLAS_CHROME_SELECTORS } from '../atlas/internals';
 import {
+  MAX_AURA,
+  MAX_LINE_WIDTH_CELLS,
   formatGameUnits,
   unitLabelFor,
   type AtlasMeasureMode,
@@ -13,6 +15,7 @@ import type {
   AtlasConditionDef,
   AtlasGrid,
   AtlasMeasure,
+  AtlasPoint,
   AtlasResourceDef,
   AtlasToken,
   SceneSnapshot,
@@ -32,30 +35,42 @@ import type { BuildState, MeasureState } from '../tools/ToolController';
 import { BuildDock } from '../ui/BuildDock';
 import { TerrainInfoWidget } from '../ui/TerrainInfoWidget';
 import { Toolbar } from '../ui/Toolbar';
-import { SceneRenderer, type GridSpec, type Tool, type TokenSpec } from './SceneRenderer';
+import { SceneRenderer, type GridSpec, type MeasureResize, type Tool, type TokenSpec } from './SceneRenderer';
 import { TextureLoader } from './textures';
 
 /**
  * One 3D map of one Atlas scene: links AtlasBinding, TerrainStore, SceneRenderer, Interaction and UI.
  *
- * This is the file that closes the circuit. Everything downstream of it already speaks Atlas —
- * the rules module, the geometry, the region engine, the measure tool and the overlay — but none
- * of it could reach Atlas until the scene handed it over. What it now provides:
+ * This is the file that closes the circuit. Everything downstream already speaks Atlas — the rules
+ * module, the geometry, the region engine, the measure tool and the overlay — but none of it could
+ * reach Atlas until the scene handed it over:
  *
- *   - `measures()`      : the kept measurements and auras Atlas holds, so a measurement drawn
- *                         with Atlas' own 2D tools appears here as the same figure.
+ *   - `measures()`      : the kept measurements and auras Atlas holds, so a measurement drawn with
+ *                         Atlas' own 2D tools appears here as the same figure.
  *   - `onAddMeasure` …  : Keep writes into Atlas, the × removes it there, Clear empties the level.
  *   - `tokenTargets()`  : tokens' LOGICAL footprints, never the TileShare-offset drawing position,
  *                         so a diagonal counts whole cells however the art is nudged.
- *   - `rules()`         : the collection's rules as Atlas resolves them, cached per snapshot
- *                         because they are pulled from the asset service, not pushed by the store.
- *   - `setMeasureContext`: the same rules, footprints, selection and speed for the tactical layer.
+ *   - `rules()`         : the collection's rules as Atlas resolves them, cached per snapshot.
  *
- * Selection is a set, not a single id: the Select (N) button of a measured area selects every
- * token inside it, in Atlas itself. The first of the set is what the camera and the HUD follow.
+ * TWO HANDLES, both Atlas' own, wired here:
  *
- * Two guards (`lastAtlasMode`, `lastAtlasKeep`) keep our own writes to Atlas from being read back
- * as changes from Atlas, which would loop.
+ *   the badge on a token's rim  -> `binding.openMeasurePopover(id)`, which is Atlas' store action
+ *                                  (`stores/uiSlice.ts`), so the panel that opens is Atlas' own.
+ *   the dot on the outline      -> a reach in cells, turned here into what Atlas stores: an aura's
+ *                                  game units and the points it then holds (`auraPoints`), or an
+ *                                  area's moved end. Verified against `measure/auraArea.ts` and
+ *                                  `measure/measureMove.ts` @ tag 0.16.0.
+ *
+ * THE MEASURE BAR is Atlas' six modes, not the legacy four. The toolbar's mode / Players / line-width
+ * controls are wired here to `binding.setMeasureTool`, the same store action Atlas' own bar writes,
+ * so choosing a mode in 3D moves Atlas' bar and vice versa. The Grid button reflects the EFFECTIVE
+ * visibility (our toggle AND Atlas' grid.enabled), so it never claims a grid that is not drawn.
+ *
+ * Selection is a set, not a single id: the Select (N) button of a measured area selects every token
+ * inside it, in Atlas itself. The first of the set is what the camera and the HUD follow.
+ *
+ * Guards (`lastAtlasMode`, `lastAtlasKeep`) keep our own writes to Atlas from being read back as
+ * changes from Atlas, which would loop.
  */
 
 const HISTORY_LIMIT = 100;
@@ -153,9 +168,9 @@ function isTokenDefeated(token: AtlasToken): boolean {
 }
 
 /**
- * The legacy four-name shape the toolbar still speaks, for an Atlas mode. `ruler` and `line` both
- * land on 'line' because the old union has no room for both; `measure.mode` carries the real one,
- * and the toolbar gains the six names in its own step.
+ * The legacy four-name shape the toolbar's fallback still speaks, for an Atlas mode. `ruler` and
+ * `line` both land on 'line' because the old union has no room for both; `measure.mode` carries the
+ * real one, and the six-name bar reads that.
  */
 function legacyShapeOf(mode: AtlasMeasureMode): AoEShape {
   switch (mode) {
@@ -175,6 +190,24 @@ function modeOfLegacyShape(shape: AoEShape): AtlasMeasureMode {
     default: return 'ruler';
   }
 }
+
+/**
+ * The way a measurement's far end lies from its origin, one unit long, over the plan. Atlas'
+ * `auraDirection`: the way its two points lie, and to the right where they say none. Atlas' y is
+ * our z, both pointing the same way on screen, so the pair carries over unchanged.
+ */
+function directionOf(points: readonly AtlasPoint[]): { x: number; z: number } {
+  const from = points[0];
+  const to = points[1];
+  if (!from || !to) return { x: 1, z: 0 };
+  const dx = to.x - from.x;
+  const dz = to.y - from.y;
+  const length = Math.hypot(dx, dz);
+  return length > 0 && Number.isFinite(length) ? { x: dx / length, z: dz / length } : { x: 1, z: 0 };
+}
+
+/** Reaches are kept to thousandths, so steps of 1.5 m never add up to 4.499999. */
+const thousandth = (value: number): number => Math.round(value * 1000) / 1000;
 
 export class Scene3D extends Component {
   private stage!: HTMLElement;
@@ -219,6 +252,7 @@ export class Scene3D extends Component {
   private mapLoad = 0;
   private hoverId: string | null = null;
   private warnedMenu = false;
+  private warnedPopover = false;
   private closed = false;
   private safeAreaFrame = 0;
 
@@ -238,11 +272,17 @@ export class Scene3D extends Component {
     });
     this.renderer.onUnpinMeasure = (id) => this.interaction.unpinMeasure(id);
     this.renderer.onSelectTokens = (ids) => this.selectMany(ids);
+    this.renderer.onOpenMeasurePopover = (id) => this.openMeasureOptions(id);
+    this.renderer.onMeasureResize = (change) => this.resizeMeasure(change);
 
     this.toolbar = new Toolbar(this.stage, {
       onTool: (tool) => this.setTool(tool),
       onBrush: (size) => { this.interaction.brush = size; this.toolbar.setBrush(size); },
       onMeasureShape: (shape) => this.setMeasureShape(shape),
+      // The six-name Atlas bar: mode, Players and line width all write Atlas' own tool state.
+      onMeasureMode: (mode) => this.setMeasureMode(mode),
+      onMeasurePlayers: (players) => this.setMeasurePlayers(players),
+      onMeasureLineWidth: (cells) => this.setMeasureLineWidth(cells),
       onMeasureKeep: () => this.toggleMeasureKeep(),
       // Clear empties the LEVEL, as Atlas's own Clear does. Local pins go with it.
       onMeasureClear: () => this.interaction.clearMeasureLevel(),
@@ -491,7 +531,8 @@ export class Scene3D extends Component {
 
   /**
    * Feeds the tactical layer what it needs to measure as Atlas does: the collection's rules, the
-   * logical footprints, the selection, and the speed of the token the ranges would be drawn around.
+   * logical footprints, the selection, the map's Snap, and the speed of the token the ranges would
+   * be drawn around. Snap is what tells a dragged reach whether it fits to whole cells or tenths.
    */
   private syncMeasureContext(): void {
     const rules = this.rulesCache ??= this.binding.sceneRules();
@@ -501,7 +542,93 @@ export class Scene3D extends Component {
       tokens: this.tokenTargets(),
       selectedIds: [...this.selectedIds],
       speed: this.selectedId !== null ? this.binding.tokenSpeed(this.selectedId) : null,
+      snapToGrid: this.snapshot?.grid?.snapToGrid !== false,
     });
+  }
+
+  // ---- Atlas' own measurement handles ---------------------------------------------------------
+
+  /**
+   * The badge on a token's rim was pressed: open Atlas' OWN options popover. Nothing of ours is
+   * drawn — the panel is Atlas', so it looks like the rest of Atlas and keeps up with its releases.
+   *
+   * `binding.openMeasurePopover` checks what Atlas' own guard checks before asking (the measurement
+   * is on the level shown, the view is the GM's of a loaded scene) and reads the field back, so a
+   * false answer means no panel opened rather than a write that silently did nothing.
+   *
+   * Where the panel appears is Atlas's choice: it anchors it to the measurement's handle in ITS OWN
+   * view. Inside an Atlas tab that is the same window; in the separate 3D pane it is the Atlas tab.
+   */
+  private openMeasureOptions(id: string): void {
+    if (this.binding.openMeasurePopover(id)) return;
+    if (this.warnedPopover) return;
+    this.warnedPopover = true;
+    new Notice(
+      'Atlas could not open its measurement options here. They need the GM view of a loaded scene, '
+      + 'and the measurement on the level shown. In the separate 3D pane the panel opens in the Atlas tab.',
+    );
+  }
+
+  /**
+   * The far handle was dragged to a new reach, in cells. Turned into what Atlas stores, by Atlas'
+   * own formulas (`measure/auraArea.ts` auraPoints / auraOfCells, `measure/measureMove.ts`
+   * areaResizedBy), and written through `updateMeasure` so 2D and 3D move together and Atlas saves it.
+   *
+   * An aura's reach is game units from the EDGE of its token's space, and the two points it holds
+   * are a snapshot of where it then lies — Atlas never rewrites them when the token moves, which is
+   * why the geometry always comes from the reach and the token's space, never from those points.
+   * They are written here anyway, as Atlas writes them whenever the aura itself is edited, so its
+   * own 2D handle stands where the 3D one does.
+   *
+   * An area keeps its origin and moves its far end along its own direction. The overlay already
+   * fitted the length to whole cells (or tenths with Alt / Snap off), so no second snap is applied.
+   */
+  private resizeMeasure(change: MeasureResize): void {
+    const snapshot = this.snapshot;
+    const grid = snapshot?.grid;
+    if (!snapshot || !grid || !(grid.size > 0)) return;
+    // A player's picture is not edited from here, as Atlas' own guard refuses it.
+    if (snapshot.isPlayerView) return;
+    const measure = snapshot.measures.find((m) => m.id === change.id);
+    // A local pin (Atlas refused the keep) has nothing to write to; it stays as it was drawn.
+    if (!measure) return;
+    const cells = Number.isFinite(change.cells) ? change.cells : 0;
+    if (!(cells > 0)) return;
+
+    const unit = this.rules().unitDistance;
+    const distance = unit > 0 ? unit : 1;
+    const direction = directionOf(measure.points);
+    const isAura = typeof measure.follows === 'string' && measure.follows !== ''
+      && typeof measure.aura === 'number' && measure.aura > 0;
+
+    if (isAura) {
+      const token = this.tokensById.get(measure.follows as string);
+      if (!token) return;
+      const aura = Math.min(MAX_AURA, thousandth(cells * distance));
+      if (!(aura > 0)) return;
+      // Atlas' auraPoints, in world pixels: half the token's space, plus the reach in cells.
+      const diameter = 2 * (token.size ?? 1) - 1;
+      const radiusPx = (Math.max(1, diameter) * grid.size) / 2 + cells * grid.size;
+      const points: AtlasPoint[] = [
+        { x: token.x, y: token.y },
+        { x: token.x + direction.x * radiusPx, y: token.y + direction.z * radiusPx },
+      ];
+      this.binding.updateMeasure(measure.id, { aura, points });
+      return;
+    }
+
+    const origin = measure.points[0];
+    if (!origin) return;
+    const lengthPx = cells * grid.size;
+    const end: AtlasPoint = {
+      x: origin.x + direction.x * lengthPx,
+      y: origin.y + direction.z * lengthPx,
+    };
+    // A ruler keeps its corners and only its end moves; an area has exactly two points.
+    const points: AtlasPoint[] = measure.points.map((p, i) =>
+      i === measure.points.length - 1 ? end : { x: p.x, y: p.y });
+    if (points.length < 2) return;
+    this.binding.updateMeasure(measure.id, { points });
   }
 
   private onScene(snapshot: SceneSnapshot): void {
@@ -551,7 +678,8 @@ export class Scene3D extends Component {
       }
     }
 
-    // The Look Atlas holds. No control draws them yet; the tool reads them when it creates a measure.
+    // The Look Atlas holds. The bar's Players toggle and width stepper read these; the tool reads
+    // them when it creates a measure.
     this.measure = {
       ...this.measure,
       players: snapshot.measurePlayers ?? this.measure.players,
@@ -559,6 +687,7 @@ export class Scene3D extends Component {
       effect: snapshot.measureEffect,
       lineWidth: snapshot.measureLineWidth ?? this.measure.lineWidth,
     };
+    this.toolbar.setMeasureState(this.measure, this.measurePinCount);
 
     this.toolbar.say(this.warning(snapshot), this.tool);
 
@@ -637,7 +766,11 @@ export class Scene3D extends Component {
 
   private applyGrid(): void {
     const grid = this.snapshot?.grid;
-    if (!grid || grid.size <= 0) { this.renderer.setGrid(null); return; }
+    if (!grid || grid.size <= 0) {
+      this.renderer.setGrid(null);
+      this.toolbar.setGrid(false);
+      return;
+    }
     const spec: GridSpec = {
       size: grid.size,
       offsetX: grid.offsetX,
@@ -646,6 +779,9 @@ export class Scene3D extends Component {
       style: resolveGridStyle(grid),
     };
     this.renderer.setGrid(spec);
+    // The button reflects what is actually drawn, not just our toggle: Atlas may have the grid
+    // disabled, and a button claiming "on" over an invisible grid is the desync this fixes.
+    this.toolbar.setGrid(spec.lines);
   }
 
   private applyTokens(): void {
@@ -832,13 +968,33 @@ export class Scene3D extends Component {
     if (this.opts.embedded) this.scheduleSafeAreaSync();
   }
 
-  /** A shape chosen in the 3D toolbar; pushed to Atlas so its own Measure bar follows. */
+  /** A legacy shape chosen in the toolbar's fallback bar; pushed to Atlas so its Measure bar follows. */
   private setMeasureShape(shape: AoEShape): void {
-    const mode = modeOfLegacyShape(shape);
-    this.measure = { ...this.measure, shape, mode };
+    this.setMeasureMode(modeOfLegacyShape(shape));
+  }
+
+  /** One of the six Atlas modes, chosen in the 3D bar; pushed to Atlas so its own Measure bar follows. */
+  private setMeasureMode(mode: AtlasMeasureMode): void {
+    this.measure = { ...this.measure, mode, shape: legacyShapeOf(mode) };
     this.lastAtlasMode = mode;
     this.toolbar.setMeasureState(this.measure, this.measurePinCount);
     this.binding.setMeasureTool({ mode });
+    this.interaction.refreshTactical();
+  }
+
+  /** The "Players see it" toggle; Atlas stores the inverse as `hidden` when a measure is kept. */
+  private setMeasurePlayers(players: boolean): void {
+    this.measure = { ...this.measure, players };
+    this.toolbar.setMeasureState(this.measure, this.measurePinCount);
+    this.binding.setMeasureTool({ players });
+  }
+
+  /** The next line's width in cells (1-20), as Atlas' tool holds it. */
+  private setMeasureLineWidth(cells: number): void {
+    const width = Math.min(MAX_LINE_WIDTH_CELLS, Math.max(1, Math.round(cells)));
+    this.measure = { ...this.measure, lineWidth: width };
+    this.toolbar.setMeasureState(this.measure, this.measurePinCount);
+    this.binding.setMeasureTool({ lineWidth: width });
     this.interaction.refreshTactical();
   }
 

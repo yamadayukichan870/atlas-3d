@@ -10,6 +10,7 @@ import {
   TacticalOverlays,
   type LosDisplay,
   type MeasureDisplay,
+  type MeasureResize,
   type TacticalOverlayContext,
 } from './TacticalOverlays';
 import { TerrainMeshes } from './TerrainMeshes';
@@ -21,6 +22,7 @@ export type {
   GhostSpec,
   LosDisplay,
   MeasureDisplay,
+  MeasureResize,
   MoveTargetSpec,
   PanDirection,
   ScreenPoint,
@@ -30,10 +32,45 @@ export type {
   ViewPreset,
 };
 
+/**
+ * The WebGL scene orchestrator: TerrainMeshes, GridLayer, CameraController, TokenLayer,
+ * ToolOverlays and TacticalOverlays, composed and drawn on invalidation.
+ *
+ * It is the one place the tactical layer's hooks are forwarded to the scene. The overlay draws
+ * Atlas' own handles — the badge on a token's rim that opens Atlas' measurement popover, and the
+ * far dot that resizes an area or an aura — but draws neither until the scene wires the matching
+ * callback, because a control that does nothing is worse than no control:
+ *
+ *   onOpenMeasurePopover -> the scene calls Atlas' `openMeasurePopover(id)`
+ *   onMeasureResize      -> the scene turns cells into what Atlas stores and writes it
+ *
+ * LOCAL CLIPPING IS ON. The volume shells (`view/measureShells.ts`) carry a horizontal clipping
+ * plane at the slice ceiling so a burst is cut where the terrain and tokens are. Three ignores
+ * per-material clipping planes until the renderer enables them; this is that switch. Materials
+ * without planes are unaffected, so nothing else pays for it.
+ *
+ * `MeasureContextData` carries the map's Snap (a dragged reach fits to whole cells or tenths) and,
+ * new, each token's LIFT — its elevation above its own floor in world units. The overlay composes
+ * that with the terrain floor it already samples to tell a token inside an area's FOOTPRINT from
+ * one its VOLUME actually reaches: a flier 15ft up is in a ground cube's footprint but out of its
+ * effect, and only the lift can say so. Unset reads as every token standing on its floor.
+ *
+ * `setOpenMeasurePopover` lets the scene point the badge's accent ring at whichever measurement
+ * Atlas itself has open (`binding.measurePopoverId()`), so the ring follows Atlas rather than our
+ * own press — including when Atlas closes its popover on a store change we never saw.
+ *
+ * The view's azimuth is handed to `updateScreenLabels` every frame: a badge sits on its token's
+ * rim, and the rim offset is turned by the camera so the badge stays at the lower left of the
+ * token ON SCREEN at any orbit, as the token HUD's own widgets do.
+ *
+ * Rendering is by invalidation, never a loop of its own: `draw()` re-arms while the camera has
+ * motion left or the tactical layer has a fade running.
+ */
 export interface TerrainSource {
   /** The terrain being shown; a getter, because it is replaced when the scene changes. */
   readonly map: BlockMap;
 }
+
 export interface GridSpec {
   size: number;
   offsetX: number;
@@ -41,6 +78,7 @@ export interface GridSpec {
   lines: boolean;
   style: GridStyle;
 }
+
 /** The map image. The renderer takes ownership of the texture and disposes it when replaced. */
 export interface MapSpec { widthPx: number; heightPx: number; texture: THREE.Texture | null }
 export interface SurfaceHit { point: THREE.Vector3; normal: THREE.Vector3 }
@@ -53,6 +91,15 @@ export interface MeasureContextData {
   tokens?: readonly AreaTokenTarget[];
   selectedIds?: readonly string[];
   speed?: number | null;
+  /** Atlas' Snap: off, a token stands anywhere and a reach is sized freely, in tenths. */
+  snapToGrid?: boolean;
+  /**
+   * Each token's elevation above its own floor, in world units (game units / unitDistance),
+   * keyed by token id. The overlay adds it to the terrain floor it samples, to separate the
+   * footprint (Atlas' cells) from the volume's reach (our spatial reading). Unset: every token
+   * reads as standing on its floor, so no flier is told apart until the scene feeds this.
+   */
+  lifts?: Readonly<Record<string, number>>;
 }
 
 function sampleTextureLuminance(texture: THREE.Texture | null | undefined): number {
@@ -76,29 +123,35 @@ function sampleTextureLuminance(texture: THREE.Texture | null | undefined): numb
   }
 }
 
-/**
- * Lightweight WebGL scene orchestrator composing TerrainMeshes, GridLayer, CameraController,
- * TokenLayer, ToolOverlays and TacticalOverlays.
- */
 export class SceneRenderer {
   readonly canvas: HTMLCanvasElement;
   onFrame: (() => void) | null = null;
   onUnpinMeasure: ((id: string) => void) | null = null;
   /** Called by a measurement pill's Select (N) button; the scene selects those tokens in Atlas. */
   onSelectTokens: ((ids: readonly string[]) => void) | null = null;
+  /**
+   * A measurement's origin badge was pressed. The scene opens Atlas' OWN options popover
+   * (`openMeasurePopover(id)`); nothing of ours is drawn. Unset: no badge is drawn at all.
+   */
+  onOpenMeasurePopover: ((id: string) => void) | null = null;
+  /**
+   * A measurement's far handle was dragged to a new reach, in cells. The scene turns that into
+   * what Atlas stores — an aura's game units and the points it then holds, or an area's moved
+   * end — and writes it. Unset: no far handle is drawn at all.
+   */
+  onMeasureResize: ((change: MeasureResize) => void) | null = null;
 
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene = new THREE.Scene();
   private readonly raycaster = new THREE.Raycaster();
   private readonly groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-
   private readonly terrain = new TerrainMeshes();
   private readonly gridLayer = new GridLayer();
   private readonly tokens = new TokenLayer();
   private readonly overlays = new ToolOverlays();
   private readonly tactical: TacticalOverlays;
   private readonly cameraRig: CameraController;
-
+  private readonly forward = new THREE.Vector3();
   private map: MapSpec | null = null;
   private mapLuminance = 0.5;
   private grid: GridSpec | null = null;
@@ -113,17 +166,19 @@ export class SceneRenderer {
     this.canvas = host.createEl('canvas', { cls: 'atlas3d-canvas' });
     this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: true });
     this.renderer.setClearColor(0x14161a);
-
+    // Volume shells cut at the slice ceiling through per-material clipping planes; three ignores
+    // those until this is on. Materials without planes (terrain, grid, tokens) are unaffected.
+    this.renderer.localClippingEnabled = true;
     this.tactical = new TacticalOverlays(host, (id) => this.onUnpinMeasure?.(id));
     this.tactical.onSelectTokens = (ids) => this.onSelectTokens?.(ids);
-
+    this.tactical.onOpenMeasurePopover = (id) => this.onOpenMeasurePopover?.(id);
+    this.tactical.onMeasureResize = (change) => this.onMeasureResize?.(change);
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x6a6f7a, 1.9));
     const sun = new THREE.DirectionalLight(0xffffff, 1.6);
     sun.position.set(-8, 14, 6);
     this.scene.add(sun, this.terrain.group, this.gridLayer.group, this.tokens.group);
     this.overlays.addTo(this.scene);
     this.tactical.addTo(this.scene);
-
     this.cameraRig = new CameraController(this.canvas, () => this.invalidate());
     this.setTool('orbit');
     this.resize();
@@ -153,9 +208,18 @@ export class SceneRenderer {
     return this.ceilingY();
   }
 
-  /** The scene feeds rules, token footprints and selection so the tactical layer measures as Atlas. */
+  /** The scene feeds rules, token footprints, selection, Snap and lifts so the tactical layer measures as Atlas. */
   setMeasureContext(data: MeasureContextData): void {
     this.measureCtx = data;
+  }
+
+  /**
+   * Which measurement's options Atlas has open, so the origin badge's accent ring follows Atlas
+   * rather than our own press. The scene reads it from `binding.measurePopoverId()` on every
+   * snapshot; a null clears the ring. Cheap to call unchanged: the overlay ignores a same-id set.
+   */
+  setOpenMeasurePopover(id: string | null): void {
+    this.tactical.setOpenMeasurePopover(id);
   }
 
   tacticalContext(): TacticalOverlayContext | null {
@@ -187,14 +251,12 @@ export class SceneRenderer {
       && old.lines === grid.lines
       && old.style.lineType === grid.style.lineType
       && old.style.cellNumbers === grid.style.cellNumbers);
-
     const sameStyle = old?.style.color === grid?.style.color
       && old?.style.opacity === grid?.style.opacity
       && old?.style.lineType === grid?.style.lineType
       && old?.style.lineWidth === grid?.style.lineWidth
       && old?.style.cellNumbers === grid?.style.cellNumbers
       && old?.style.numberOpacity === grid?.style.numberOpacity;
-
     this.grid = grid;
     if (grid && !sameStyle) {
       this.gridLayer.setGridStyle(this.resolveGridStyle(grid.style));
@@ -232,7 +294,6 @@ export class SceneRenderer {
     this.terrain.imageMaterial.map = useImage ? (this.map?.texture ?? null) : null;
     this.terrain.imageMaterial.color.set(useImage ? 0xffffff : 0x6b7280);
     this.terrain.imageMaterial.needsUpdate = true;
-
     this.terrain.setOptions({
       map: bm,
       layout,
@@ -251,7 +312,6 @@ export class SceneRenderer {
     this.gridLayer.setGridStyle(this.resolveGridStyle(grid.style));
     this.terrain.rebuildAll();
     this.gridLayer.rebuildAll();
-
     const { x0, x1, z0, z1 } = layout.bounds;
     this.center.set((x0 + x1) / 2, 0, (z0 + z1) / 2);
     this.cameraRig.setBounds(Math.max(x1 - x0, z1 - z0) * 0.75);
@@ -351,9 +411,12 @@ export class SceneRenderer {
     this.cameraRig.clearPanKeys();
   }
 
-  /** Horizontal viewing direction in degrees (`0°` = -Z North, `90°` = +X East, `180°` = +Z South, `270°` = -X West). */
+  /**
+   * Horizontal viewing direction in degrees (`0°` = -Z North, `90°` = +X East, `180°` = +Z South,
+   * `270°` = -X West). Read every frame, so the scratch vector is reused rather than allocated.
+   */
   cameraAzimuthDeg(): number {
-    const forward = new THREE.Vector3();
+    const forward = this.forward;
     this.cameraRig.camera.getWorldDirection(forward);
     forward.y = 0;
     if (forward.lengthSq() < 1e-6) {
@@ -426,7 +489,6 @@ export class SceneRenderer {
       const sy = this.source.map.surfaceHeightAt(cx + 0.5, cz + 0.5, cap);
       return new THREE.Vector3(layout.originX + cx + 0.5, sy, layout.originZ + cz + 0.5);
     }
-
     const planeHit = this.pickPlane(event, 0);
     if (!planeHit || !layout) return planeHit;
     if (!snap) return planeHit;
@@ -508,12 +570,17 @@ export class SceneRenderer {
     this.disposed = true;
     if (this.frame !== 0) this.host.win.cancelAnimationFrame(this.frame);
     this.cameraRig.dispose();
+    // The map texture is this file's to dispose: TerrainMeshes.dispose() disposes whatever its
+    // image material still points at, which is the SAME texture. Letting go of it first is what
+    // keeps it from being disposed twice.
+    this.terrain.imageMaterial.map = null;
     this.terrain.dispose();
     this.gridLayer.dispose();
     this.tokens.dispose();
     this.overlays.dispose();
     this.tactical.dispose();
     this.map?.texture?.dispose();
+    this.map = null;
     this.renderer.dispose();
     this.renderer.forceContextLoss();
     this.canvas.remove();
@@ -552,7 +619,14 @@ export class SceneRenderer {
     this.tokens.placeAll(this.tokenContext());
     this.tokens.updateBillboards(this.cameraRig.camera, this.cameraRig.polarAngle);
     this.renderer.render(this.scene, this.cameraRig.camera);
-    this.tactical.updateScreenLabels(this.cameraRig.camera, this.host.clientWidth, this.host.clientHeight);
+    // After the render, so the camera's world matrix is the one just drawn: a badge's rim offset
+    // is turned by this bearing, and reading a stale one would put it a frame behind the orbit.
+    this.tactical.updateScreenLabels(
+      this.cameraRig.camera,
+      this.host.clientWidth,
+      this.host.clientHeight,
+      this.cameraAzimuthDeg(),
+    );
     this.onFrame?.();
     if (animating || this.tactical.isAnimating()) this.invalidate();
   }

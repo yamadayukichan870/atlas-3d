@@ -1,6 +1,7 @@
 import type { Surface } from '../terrain/blocks';
 import type { AoEShape } from '../terrain/raycast';
 import type { MeasureState } from '../tools/ToolController';
+import type { AtlasMeasureMode } from '../atlas/measureRules';
 import type { CameraKind, Tool, ViewPreset } from '../view/SceneRenderer';
 
 export interface ToolbarHandlers {
@@ -21,39 +22,83 @@ export interface ToolbarHandlers {
   onSliceStep(delta: -1 | 1): void;
   onExit?(): void;
   onDock?(): void;
+
+  // ---- Atlas parity (optional until the scene wires them) -------------------------------------
+  /** A mode chosen in the six-name Atlas bar; pushed to Atlas via setMeasureTool. When present,
+   *  the bar shows the six real modes (ruler and line apart); absent, the legacy four shapes. */
+  onMeasureMode?(mode: AtlasMeasureMode): void;
+  /** The "Players see it" toggle; pushed to Atlas as measureTool.players. */
+  onMeasurePlayers?(players: boolean): void;
+  /** The next line's width in cells (1-20); pushed to Atlas as measureTool.lineWidth. */
+  onMeasureLineWidth?(cells: number): void;
 }
 
 const TOOLS: ReadonlyArray<{ tool: Tool; label: string; hint: string }> = [
   { tool: 'orbit', label: 'Orbit', hint: 'Left drag rotates, right drag pans, wheel zooms, Arrows pan, [ / ] or Alt+Q/E turn 90°, Home/Alt+H or double click centers. Click a token to select, right click for menu, Ctrl+hover for statblock.' },
   { tool: 'raise', label: 'Raise', hint: 'Paint columns up by one layer. Right drag rotates, Arrows pan.' },
   { tool: 'lower', label: 'Lower', hint: 'Paint columns down by one layer. Right drag rotates, Arrows pan.' },
-  { tool: 'build', label: 'Build', hint: 'Click to add, rotate or remove single blocks. Hold Alt to remove, R to turn the piece. Right drag rotates.' },
+  { tool: 'build', label: 'Build', hint: 'Click to add, rotate or remove single blocks. Hold Alt to remove, Alt+R to turn the piece (Alt+Shift+R the other way). Right drag rotates.' },
   { tool: 'move', label: 'Move', hint: 'Drag a token; it snaps to the grid and is written back to Atlas. Double click centers camera.' },
-  { tool: 'measure', label: 'Measure', hint: '3D Ruler & AoE: drag or click-click to measure distance & ΔH. Space or Shift+Click adds waypoints, Alt disables snap, Esc/right-click cancels.' },
+  { tool: 'measure', label: 'Measure', hint: '3D Ruler & AoE: drag or click-click to measure. Shift+Click adds a waypoint, Alt disables snap, Shift on release reverses Keep, Esc/right-click cancels.' },
   { tool: 'los', label: 'LoS', hint: '3D Line of Sight: click origin token or cell, sweep to target (green = clear, yellow = partial cover, red = blocked). Click to lock, Esc/right-click resets.' },
 ];
 
-const MEASURE_SHAPES: ReadonlyArray<{ shape: AoEShape; label: string; hint: string }> = [
+/** The legacy four-name bar, shown until the scene wires onMeasureMode. */
+const LEGACY_MEASURE_SHAPES: ReadonlyArray<{ shape: AoEShape; label: string; hint: string }> = [
   { shape: 'line', label: 'Line', hint: '3D multi-waypoint ruler' },
   { shape: 'sphere', label: 'Sphere', hint: '3D spherical AoE & terrain projection' },
   { shape: 'cone', label: 'Cone', hint: '3D cone AoE & terrain projection' },
   { shape: 'cube', label: 'Cube', hint: '3D cube AoE & terrain projection' },
 ];
 
+/** The six real Atlas modes, shown once the scene wires onMeasureMode. Hints follow Atlas' own
+ *  semantics: a circle is a plan circle, a square is a box from the middle of its near side, a
+ *  line is a rectangle as long as the drag and its width wide, ranges are labelled rings. */
+const ATLAS_MEASURE_MODES: ReadonlyArray<{ mode: AtlasMeasureMode; label: string; hint: string }> = [
+  { mode: 'ruler', label: 'Ruler', hint: 'Measure a path. Shift+Click adds a corner; the climb folds into the diagonal rule once.' },
+  { mode: 'circle', label: 'Circle', hint: 'A circle on the plan, as far as the drag, projected onto every surface it covers.' },
+  { mode: 'cone', label: 'Cone', hint: 'A cone from the origin towards the drag, opening the collection\'s angle.' },
+  { mode: 'square', label: 'Square', hint: 'A box from the middle of its near side, as long and as wide as the drag.' },
+  { mode: 'line', label: 'Line', hint: 'A rectangle as long as the drag and its width wide; its middle line covers every cell it crosses.' },
+  { mode: 'ranges', label: 'Ranges', hint: 'Labelled rings around a token: its range bands, or its movement steps.' },
+];
+
+/** Atlas' own line-width bounds (measureTypes.ts MAX_LINE_WIDTH = 20, default 1). */
+const MIN_LINE_WIDTH = 1;
+const MAX_LINE_WIDTH = 20;
+
 export class Toolbar {
   readonly el: HTMLElement;
   private readonly toolButtons = new Map<Tool, HTMLButtonElement>();
   private readonly brushButtons = new Map<number, HTMLButtonElement>();
+  private readonly brushGroup: HTMLElement;
+  private readonly undoButton: HTMLButtonElement;
   private readonly measureBar: HTMLElement;
-  private readonly measureShapeButtons = new Map<AoEShape, HTMLButtonElement>();
+  private readonly legacyShapeButtons = new Map<AoEShape, HTMLButtonElement>();
+  private readonly modeButtons = new Map<AtlasMeasureMode, HTMLButtonElement>();
   private readonly measureKeepButton: HTMLButtonElement;
   private readonly measureClearButton: HTMLButtonElement;
+  private readonly playersButton: HTMLButtonElement | null = null;
+  private readonly widthWrap: HTMLElement | null = null;
+  private readonly widthValue: HTMLElement | null = null;
+  private readonly widthDown: HTMLButtonElement | null = null;
+  private readonly widthUp: HTMLButtonElement | null = null;
   private readonly surfaceButton: HTMLButtonElement;
   private readonly layerButton: HTMLButtonElement;
   private readonly sliceDownButton: HTMLButtonElement;
   private readonly sliceButton: HTMLButtonElement;
   private readonly sliceUpButton: HTMLButtonElement;
+  private readonly camButton: HTMLButtonElement;
+  private readonly gridButton: HTMLButtonElement;
   private readonly status: HTMLElement;
+
+  private cameraKind: CameraKind = 'ortho';
+  private gridOn = true;
+  private canEdit = true;
+  /** The measure choices as last set, so the new controls' clicks read fresh values. */
+  private mode: AtlasMeasureMode = 'ruler';
+  private players = true;
+  private lineWidth = 1;
 
   constructor(root: HTMLElement, handlers: ToolbarHandlers) {
     const wrap = root.createDiv({ cls: 'atlas3d-toolbar' });
@@ -70,11 +115,12 @@ export class Toolbar {
     for (const { tool, label, hint } of TOOLS) {
       this.toolButtons.set(tool, button(tools, label, hint, () => handlers.onTool(tool)));
     }
-    const brush = group();
+
+    this.brushGroup = group();
     for (const size of [1, 2, 3]) {
-      this.brushButtons.set(size, button(brush, `${size}×${size}`, `Brush size ${size}×${size} cells`, () => handlers.onBrush(size)));
+      this.brushButtons.set(size, button(this.brushGroup, `${size}×${size}`, `Brush size ${size}×${size} cells`, () => handlers.onBrush(size)));
     }
-    button(brush, 'Undo', 'Undo the last terrain stroke (Ctrl/Cmd+Z)', () => handlers.onUndo());
+    this.undoButton = button(this.brushGroup, 'Undo', 'Undo the last terrain stroke (Ctrl/Cmd+Z)', () => handlers.onUndo());
 
     const camera = group();
     button(camera, 'Iso', 'Isometric view', () => handlers.onPreset('iso'));
@@ -82,19 +128,15 @@ export class Toolbar {
     button(camera, '⟲', 'Rotate view 90° left ([ or Alt+Q)', () => handlers.onRotateView(-90), 'atlas3d-btn-icon');
     button(camera, '⟳', 'Rotate view 90° right (] or Alt+E)', () => handlers.onRotateView(90), 'atlas3d-btn-icon');
     button(camera, '⌖', 'Center camera on selected token or map (Home or Alt+H)', () => handlers.onCenter(), 'atlas3d-btn-icon');
-    let ortho = true;
-    const cam = button(camera, 'Ortho', 'Switch between orthographic and perspective', () => {
-      ortho = !ortho;
-      cam.setText(ortho ? 'Ortho' : 'Persp');
-      handlers.onCamera(ortho ? 'ortho' : 'persp');
+    this.camButton = button(camera, 'Ortho', 'Switch between orthographic and perspective', () => {
+      this.setCamera(this.cameraKind === 'ortho' ? 'persp' : 'ortho');
+      handlers.onCamera(this.cameraKind);
     });
 
     const view = group();
-    let grid = true;
-    const gridBtn = button(view, 'Grid', 'Show or hide cell outlines', () => {
-      grid = !grid;
-      gridBtn.toggleClass('is-off', !grid);
-      handlers.onGrid(grid);
+    this.gridButton = button(view, 'Grid', 'Show or hide cell outlines', () => {
+      this.setGrid(!this.gridOn);
+      handlers.onGrid(this.gridOn);
     });
     this.surfaceButton = button(view, 'Map image', 'Show the map image on the terrain, or the blocks\' own colours', () => {
       handlers.onSurface(this.surfaceButton.dataset.surface === 'image' ? 'colors' : 'image');
@@ -112,12 +154,34 @@ export class Toolbar {
       if (handlers.onDock) button(session, 'Into Atlas', 'Show this 3D map inside Atlas\'s own view, under its interface', () => handlers.onDock?.());
     }
 
+    // ---- the measure bar ---------------------------------------------------------------------
     this.measureBar = wrap.createDiv({ cls: 'atlas3d-group atlas3d-measure-bar is-hidden' });
-    for (const { shape, label, hint } of MEASURE_SHAPES) {
-      this.measureShapeButtons.set(shape, button(this.measureBar, label, hint, () => handlers.onMeasureShape(shape)));
+    if (handlers.onMeasureMode) {
+      const onMode = handlers.onMeasureMode;
+      for (const { mode, label, hint } of ATLAS_MEASURE_MODES) {
+        this.modeButtons.set(mode, button(this.measureBar, label, hint, () => onMode(mode)));
+      }
+    } else {
+      for (const { shape, label, hint } of LEGACY_MEASURE_SHAPES) {
+        this.legacyShapeButtons.set(shape, button(this.measureBar, label, hint, () => handlers.onMeasureShape(shape)));
+      }
     }
-    this.measureKeepButton = button(this.measureBar, 'Keep', 'Pin measurements on the 3D map', () => handlers.onMeasureKeep());
-    this.measureClearButton = button(this.measureBar, 'Clear', 'Remove all pinned 3D measurements', () => handlers.onMeasureClear());
+    this.measureKeepButton = button(this.measureBar, 'Keep', 'Keep the measurement on the map (Shift on release reverses this)', () => handlers.onMeasureKeep());
+
+    if (handlers.onMeasurePlayers) {
+      const onPlayers = handlers.onMeasurePlayers;
+      this.playersButton = button(this.measureBar, 'Players', 'Players see what is measured and kept', () => onPlayers(!this.players));
+    }
+
+    if (handlers.onMeasureLineWidth) {
+      const onWidth = handlers.onMeasureLineWidth;
+      this.widthWrap = this.measureBar.createDiv({ cls: 'atlas3d-width' });
+      this.widthDown = button(this.widthWrap, '−', 'Narrower line (one cell less)', () => onWidth(Math.max(MIN_LINE_WIDTH, this.lineWidth - 1)), 'atlas3d-btn-icon');
+      this.widthValue = this.widthWrap.createSpan({ cls: 'atlas3d-width-value', text: '1' });
+      this.widthUp = button(this.widthWrap, '+', 'Wider line (one cell more)', () => onWidth(Math.min(MAX_LINE_WIDTH, this.lineWidth + 1)), 'atlas3d-btn-icon');
+    }
+
+    this.measureClearButton = button(this.measureBar, 'Clear', 'Remove every kept measurement of the level shown (Atlas\'s own Clear)', () => handlers.onMeasureClear());
 
     this.status = root.createDiv({ cls: 'atlas3d-status' });
     this.setTool('orbit');
@@ -129,21 +193,55 @@ export class Toolbar {
   setTool(tool: Tool): void {
     for (const [name, el] of this.toolButtons) el.toggleClass('is-active', name === tool);
     this.measureBar.toggleClass('is-hidden', tool !== 'measure');
+    // The brush sizes and Undo belong to the terrain tools; elsewhere they do nothing, so they hide.
+    const usesBrush = tool === 'raise' || tool === 'lower' || tool === 'build';
+    this.brushGroup.toggleClass('is-hidden', !usesBrush);
     this.status.setText(TOOLS.find((t) => t.tool === tool)?.hint ?? '');
   }
 
   setMeasureState(state: MeasureState, pinCount: number): void {
-    for (const [shape, el] of this.measureShapeButtons) el.toggleClass('is-active', shape === state.shape);
+    // The Atlas mode wins where it is set; the legacy shape is the fallback.
+    const mode: AtlasMeasureMode = state.mode ?? legacyModeOf(state.shape);
+    this.mode = mode;
+    this.players = state.players !== false;
+    this.lineWidth = clampWidth(state.lineWidth);
+
+    for (const [shape, el] of this.legacyShapeButtons) el.toggleClass('is-active', shape === state.shape);
+    for (const [m, el] of this.modeButtons) el.toggleClass('is-active', m === mode);
     this.measureKeepButton.toggleClass('is-active', state.keep);
     this.measureClearButton.disabled = pinCount === 0;
+
+    if (this.playersButton) this.playersButton.toggleClass('is-active', this.players);
+    if (this.widthWrap && this.widthValue && this.widthDown && this.widthUp) {
+      // The width only means anything for a line; hide it for the other modes.
+      this.widthWrap.toggleClass('is-hidden', mode !== 'line');
+      this.widthValue.setText(String(this.lineWidth));
+      this.widthDown.disabled = this.lineWidth <= MIN_LINE_WIDTH;
+      this.widthUp.disabled = this.lineWidth >= MAX_LINE_WIDTH;
+    }
   }
 
   setCanEdit(canEdit: boolean): void {
+    this.canEdit = canEdit;
     for (const tool of ['raise', 'lower', 'build', 'move'] as const) {
       const btn = this.toolButtons.get(tool);
       if (btn) btn.disabled = !canEdit;
     }
     for (const btn of this.brushButtons.values()) btn.disabled = !canEdit;
+    // Without an editable grid there can be no terrain stroke, so there is nothing to undo.
+    this.undoButton.disabled = !canEdit;
+  }
+
+  /** The camera kind as the scene holds it, so the button never drifts from the actual projection. */
+  setCamera(kind: CameraKind): void {
+    this.cameraKind = kind;
+    this.camButton.setText(kind === 'ortho' ? 'Ortho' : 'Persp');
+  }
+
+  /** The grid visibility as the scene holds it, so the button reflects Atlas's grid.enabled too. */
+  setGrid(on: boolean): void {
+    this.gridOn = on;
+    this.gridButton.toggleClass('is-off', !on);
   }
 
   setSurface(surface: Surface, hasImage: boolean): void {
@@ -174,4 +272,19 @@ export class Toolbar {
   say(text: string | null, tool: Tool): void {
     this.status.setText(text ?? TOOLS.find((t) => t.tool === tool)?.hint ?? '');
   }
+}
+
+/** The Atlas mode a legacy toolbar shape means. The old 'line' was the multi-waypoint ruler. */
+function legacyModeOf(shape: AoEShape): AtlasMeasureMode {
+  switch (shape) {
+    case 'sphere': return 'circle';
+    case 'cube': return 'square';
+    case 'cone': return 'cone';
+    default: return 'ruler';
+  }
+}
+
+function clampWidth(cells: number | undefined): number {
+  if (typeof cells !== 'number' || !Number.isFinite(cells)) return 1;
+  return Math.min(MAX_LINE_WIDTH, Math.max(MIN_LINE_WIDTH, Math.round(cells)));
 }

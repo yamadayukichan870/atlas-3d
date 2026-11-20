@@ -60,6 +60,13 @@ import {
  *   - `countPerTurn` is on only when stored as true, not by default;
  *   - a cone's end defaults to `round`, not `flat`;
  *   - a map outside a collection measures in range bands unless its grid says 'units'.
+ *
+ * Atlas' own interface is reused wherever it has one, rather than rebuilt: its right-click token
+ * menu, its token editor, its statblock window, and — added here — its measurement options
+ * popover. `stores/uiSlice.ts` carries `openMeasurePopover(measureId)` and `closeMeasurePopover()`
+ * as store actions, the same door `setMeasureTool` goes through, so the panel a GM gets from the
+ * 3D map is Atlas' own, with its colours, its effects and its toggles, and it stays in step with
+ * every Atlas release without a line of ours.
  */
 
 function recordOf(value: unknown): Record<string, unknown> | null {
@@ -182,7 +189,7 @@ export function snapshotOf(state: AtlasSceneState): SceneSnapshot {
     mapPath: state.mapPath ?? null,
     ready: state.mapLoaded === true && state.isMapLoading !== true,
     // Atlas: the first level's background is the scene's own `background`.
-    background: isBase ? (state.background ?? null) : (shown.background ?? null),
+    background: isBase ? (state.background ?? null) : (shown?.background ?? null),
     grid: state.grid ?? null,
     tokens: tokensOnLevel(state, shownId, first?.id),
     measures: measuresOnLevel(state, shownId, first?.id),
@@ -280,6 +287,24 @@ export interface MeasurePayload {
   /** The level it stands on; absent is the level shown. */
   level?: string;
   origin?: AtlasMeasureOrigin;
+}
+
+/**
+ * The part of Atlas's state its own measurement popover reads. Verified against
+ * `pixi/measure/measurePopoverGuard.ts` @ tag 0.16.0: `mayEditMeasure` wants the measurement on
+ * the level shown and the GM's view of a loaded scene, and `closeStaleMeasurePopover` closes a
+ * popover that no longer passes that test on EVERY store change.
+ *
+ * Every field is optional here, as every probed field in this plugin is: an Atlas that does not
+ * name one is read as not forbidding it, which is the same tolerance `snapshotOf` already applies
+ * to `isGMView`. These two fields belong in `AtlasSceneActions`/`AtlasSceneState` alongside the
+ * other actions; they are probed here so this file compiles without a second file changing.
+ */
+interface PopoverEditState {
+  readonly measurePopover?: unknown;
+  readonly isGMView?: boolean;
+  readonly isPlayerView?: boolean;
+  readonly isMapLoading?: boolean;
 }
 
 /** Follows one Atlas tab's store and reports a snapshot whenever something the 3D view draws changed. */
@@ -466,7 +491,6 @@ export class AtlasBinding {
     const state = this.store?.getState();
     if (state === undefined || typeof state.addMeasure !== 'function') return null;
     if (!ATLAS_MEASURE_SHAPES.includes(payload.shape)) return null;
-
     const follows = typeof payload.follows === 'string' && payload.follows !== '' ? payload.follows : null;
     if (follows !== null && (typeof payload.aura !== 'number' || !(payload.aura > 0))) return null;
 
@@ -500,7 +524,6 @@ export class AtlasBinding {
         unseenAtStart: origin.unseenAtStart === true,
       };
     }
-
     try {
       const id = state.addMeasure(data);
       return typeof id === 'string' && id !== '' ? id : null;
@@ -578,6 +601,84 @@ export class AtlasBinding {
     if (state === undefined || typeof state.setMeasureTool !== 'function') return false;
     state.setMeasureTool(updates as Record<string, unknown>);
     return true;
+  }
+
+  // ---- Atlas's own measurement popover --------------------------------------------------------
+
+  /**
+   * Opens Atlas's OWN options popover for a kept measurement — its colours, its effects, its light,
+   * its audience, its walls and its Delete. Nothing of ours is drawn: the panel is Atlas', so it
+   * looks like the rest of Atlas and keeps up with its releases by itself.
+   *
+   * Verified against `stores/uiSlice.ts` @ tag 0.16.0:
+   *   openMeasurePopover: (measureId) => set((draft) => {
+   *     draft.measurePopover = measureId;
+   *     draft.lightPopover = null;
+   *     draft.lightZonePopover = null;
+   *   })
+   * so it is an ordinary store action, the same door `setMeasureTool` goes through, and it closes
+   * an open light popover as Atlas' own badge does.
+   *
+   * Three things are checked before asking, because Atlas would undo the ask otherwise:
+   *   - the measurement is on the level shown (`mayEditMeasure` in `measurePopoverGuard.ts`);
+   *   - the view is the GM's of a loaded scene, not the Player View — a popover opened there is
+   *     closed again by `closeStaleMeasurePopover` on the very next store change;
+   *   - the action exists at all.
+   *
+   * The answer is read back from `measurePopover` rather than assumed: the action returns void, so
+   * the field is the only evidence it took. False means "no panel of Atlas is open for this", and
+   * the caller may say so instead of leaving a button that appears to do nothing.
+   *
+   * Where the panel appears is Atlas's choice, not ours: it anchors it to the measurement's handle
+   * in ITS OWN view. Inside an Atlas tab (the embedded 3D map) that is the same window. In the
+   * separate 3D pane it is the Atlas tab, which may be behind this one.
+   */
+  openMeasurePopover(id: string): boolean {
+    const store = this.store;
+    if (store === null || typeof id !== 'string' || id === '') return false;
+    const state = store.getState();
+    const open = field(state, 'openMeasurePopover');
+    if (typeof open !== 'function') return false;
+    if (!state.objects?.measures?.[id]) return false;
+
+    const view = state as PopoverEditState;
+    if (view.isGMView === false || view.isPlayerView === true || view.isMapLoading === true) return false;
+
+    try {
+      (open as (measureId: string) => void).call(state, id);
+    } catch (error) {
+      console.error('[Atlas 3D] Atlas could not open its measurement options', error);
+      return false;
+    }
+    return (store.getState() as PopoverEditState).measurePopover === id;
+  }
+
+  /**
+   * Closes Atlas's measurement popover, if one is open. False when this Atlas has no such action
+   * or nothing was open — closing nothing is not a write, and a store write here would be a
+   * needless notify on every gesture that ends.
+   */
+  closeMeasurePopover(): boolean {
+    const store = this.store;
+    if (store === null) return false;
+    const state = store.getState();
+    const close = field(state, 'closeMeasurePopover');
+    if (typeof close !== 'function') return false;
+    const open = (state as PopoverEditState).measurePopover;
+    if (typeof open !== 'string' || open === '') return false;
+    try {
+      (close as () => void).call(state);
+      return true;
+    } catch (error) {
+      console.error('[Atlas 3D] Atlas could not close its measurement options', error);
+      return false;
+    }
+  }
+
+  /** The measurement whose options popover Atlas currently has open, or null. */
+  measurePopoverId(): string | null {
+    const open = (this.store?.getState() as PopoverEditState | undefined)?.measurePopover;
+    return typeof open === 'string' && open !== '' ? open : null;
   }
 
   /** Opens Atlas's own right-click menu for a token at a screen position. False when Atlas will not. */

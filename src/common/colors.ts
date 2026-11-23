@@ -21,6 +21,10 @@
  * `THREE.Color` satisfies, so this module stays pure and testable in Node. The one part
  * that needs a DOM is the CSS round-trip, and it degrades to the fallback when there is none.
  *
+ * The badge colours and `readableTint` at the bottom are Atlas' own, ported from
+ * atlas-vtt/atlas-vtt @ tag 0.18.0 (identical in 0.19.0). They are the reason a handle's ring
+ * reads as the same colour as the line it belongs to.
+ *
  * Not here, on purpose: `hexToLinear` stays in terrain/blockGeometry.ts. That is linear-space
  * vertex-colour maths with its own cache, a different concern from naming a colour.
  */
@@ -52,6 +56,7 @@ export const ATLAS_COLOR_MAP: Readonly<Record<string, string>> = Object.freeze({
 
 /** The colour a token ring takes when nothing names one. */
 export const DEFAULT_RING_COLOR = '#ffffff';
+
 /** The colour a measurement takes when the theme names no accent: the blue the overlay always used. */
 export const DEFAULT_MEASURE_COLOR = '#38bdf8';
 
@@ -168,6 +173,7 @@ export function cssColorToHex(value: string): string | null {
 }
 
 const resolved = new Map<string, string>();
+
 /** Colours are a palette plus what a GM types: a handful. A cap keeps a stray loop from growing it. */
 const RESOLVED_LIMIT = 256;
 
@@ -234,4 +240,135 @@ export function resolveMeasureColor(color: string | null | undefined, el: HTMLEl
   }
   const accent = themeAccent(el);
   return accent === '' ? DEFAULT_MEASURE_COLOR : resolveColorHex(accent, DEFAULT_MEASURE_COLOR);
+}
+
+// ---- Atlas' canvas badge colours, and the tint its handle rings are drawn in -----------------
+//
+// Ported from atlas-vtt/atlas-vtt @ tag 0.18.0 (identical in 0.19.0):
+//   pixi/utils/canvasBadgeColors.ts -> canvasBadgeColors / canvasBadgeTheme
+//   pixi/lighting/lightMarker.ts    -> luminance / contrast / mix / readableTint / lightColorNumber
+//
+// WHY THIS EXISTS. The overlay lifted a handle's ring toward white with an invented luminance
+// threshold, which is not what Atlas does and made the handle read as a different colour from the
+// line it belongs to. Atlas asks for WCAG contrast 3 against the BADGE'S OWN PLATE — a fixed
+// 0x2a2a2a on the dark theme, not the map and not --background-primary — and moves the colour the
+// least it can, toward white on a dark plate and toward BLACK on a light one.
+//
+// Measured with these formulas: fire #ec7500 contrasts 4.86 on the dark plate, so Atlas leaves it
+// exactly as it is; the old threshold lightened it by about a quarter. Lightning #086ddd and
+// shadow #7852ee sit at 2.90, so Atlas lifts them by under two percent — which is why using the
+// raw hex instead would be wrong for those two. On the light plate Atlas DARKENS fire to #cc6500.
+//
+// Pure arithmetic, no three.js and no DOM, so it is tested in Node. Only the two theme accessors
+// touch the document, and they read the host's own so a popout gets its own window's theme.
+
+/** Screen colours of a canvas badge, as Atlas holds them. */
+export interface CanvasBadgeColors {
+  /** The plate the badge is drawn on. */
+  background: number;
+  /** Border and text colour. */
+  stroke: number;
+}
+
+/** The badge colours and the theme's accent: what a GM edits on the map is drawn in. */
+export interface CanvasBadgeTheme extends CanvasBadgeColors {
+  accent: number;
+}
+
+/** Atlas' warm fallback for a colour string it cannot read (FALLBACK_COLOR). */
+const LIGHT_FALLBACK = 0xffcc66;
+/** Colours below this contrast against the badge are moved toward black or white until they reach it. */
+const MIN_GLYPH_CONTRAST = 3;
+
+const channels = (color: number): [number, number, number] =>
+  [(color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff];
+
+const numberHex = (color: number): string => `#${(color >>> 0).toString(16).padStart(6, '0')}`;
+
+/** Relative luminance of an sRGB colour, as WCAG defines it. */
+function luminance(color: number): number {
+  const [r, g, b] = channels(color).map((channel) => {
+    const v = channel / 255;
+    return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+  }) as [number, number, number];
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/** WCAG contrast ratio of two colours, 1 to 21. */
+export function contrastRatio(a: number, b: number): number {
+  const la = luminance(a);
+  const lb = luminance(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+
+function mixChannels(color: number, towards: number, amount: number): number {
+  const from = channels(color);
+  const to = channels(towards);
+  const [r, g, b] = from.map((c, i) => Math.round(c + (to[i]! - c) * amount)) as [number, number, number];
+  return (r << 16) | (g << 8) | b;
+}
+
+/**
+ * `color` as it reads on `background`: unchanged where it contrasts enough, else moved toward
+ * black on a light plate and toward white on a dark one, NO FURTHER THAN NEEDED — twelve halvings
+ * find the least mix that reaches the threshold, so a pale colour keeps its hue.
+ */
+export function readableTint(color: number, background: number): number {
+  if (contrastRatio(color, background) >= MIN_GLYPH_CONTRAST) return color;
+  const towards = luminance(background) > 0.5 ? 0x000000 : 0xffffff;
+  let low = 0;
+  let high = 1;
+  for (let i = 0; i < 12; i++) {
+    const amount = (low + high) / 2;
+    if (contrastRatio(mixChannels(color, towards, amount), background) >= MIN_GLYPH_CONTRAST) high = amount;
+    else low = amount;
+  }
+  return mixChannels(color, towards, high);
+}
+
+/** '#rrggbb' as a number; Atlas' warm light colour for anything else. */
+export function lightColorNumber(color: string): number {
+  return isHexColor(color) ? Number.parseInt(color.slice(1), 16) : LIGHT_FALLBACK;
+}
+
+/** The host's own document, so a popout reads its own theme; dark where there is none to read. */
+function isDarkTheme(host: HTMLElement | null): boolean {
+  const body = host?.doc?.body ?? (typeof document !== 'undefined' ? document.body : null);
+  return body ? body.classList.contains('theme-dark') : true;
+}
+
+/** The plate and ink of a canvas badge. Fixed values, not the theme's background variables. */
+export function canvasBadgeColors(host: HTMLElement | null = null): CanvasBadgeColors {
+  return isDarkTheme(host)
+    ? { background: 0x2a2a2a, stroke: 0xffffff }
+    : { background: 0xe3e3e3, stroke: 0x000000 };
+}
+
+/** The same plus the theme's accent, which a measurement naming no colour is drawn in. */
+export function canvasBadgeTheme(host: HTMLElement | null = null): CanvasBadgeTheme {
+  const accent = resolveColorHex(themeAccent(host), '#7852ee');
+  return { ...canvasBadgeColors(host), accent: lightColorNumber(accent) };
+}
+
+/** The ink a badge's glyph is drawn in, as '#rrggbb'. */
+export function badgeInk(host: HTMLElement | null = null): string {
+  return numberHex(canvasBadgeColors(host).stroke);
+}
+
+/**
+ * The ring colour of a measurement's handle: the measurement's own colour made readable on the
+ * badge's plate, or the theme's accent where it names none. This is `measureHandleLook`'s
+ * `ringColor`, and it is what makes the handle read as the same colour as the line it belongs to.
+ *
+ * A CSS colour name is resolved first, which Atlas does not need (its schema is always '#rrggbb')
+ * but costs nothing here; anything unreadable lands on Atlas' own warm fallback either way.
+ */
+export function measureRingColor(
+  color: string | null | undefined,
+  host: HTMLElement | null,
+): string {
+  const theme = canvasBadgeTheme(host);
+  const named = typeof color === 'string' && color.trim() !== '' ? color.trim() : null;
+  const base = named !== null ? lightColorNumber(resolveColorHex(named, '#ffcc66')) : theme.accent;
+  return numberHex(readableTint(base, theme.background));
 }

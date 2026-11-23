@@ -1,5 +1,4 @@
 import {
-  ATLAS_MEASURE_SHAPES,
   DEFAULT_LINE_WIDTH_CELLS,
   MAX_RULER_POINTS,
   areaShapeRules,
@@ -12,48 +11,98 @@ import {
   snapAreaOrigin,
   snapRulerPoint,
   type AtlasMeasureMode,
-  type AtlasMeasureShape,
   type AtlasMeasurementSettings,
   type SnapGrid,
 } from '../atlas/measureRules';
+import {
+  atlasModeOfLegacy,
+  atlasShapeOf,
+  isLegacyShape,
+  shapeOfMode,
+} from '../atlas/measureVocabulary';
 import type { AtlasMeasure, AtlasPoint } from '../atlas/types';
 import { shapedArea, tokensInArea, type AreaTokenTarget, type PlanPoint } from '../terrain/measureGeometry';
 import type { Vec3 } from '../terrain/shapes';
 import type { MeasureDisplay, MeasureLeg, TacticalOverlayContext } from '../view/TacticalOverlays';
 import { CLICK_SLOP_PX, type ToolContext, type ToolHandler } from './ToolController';
 
+/**
+ * The measure tool: the six modes Atlas' own Measure bar offers, measuring by the rules Atlas
+ * resolves for this scene.
+ *
+ * TWO VOCABULARIES, TWO DOORS. This file reads shapes from two places that do not share a
+ * vocabulary, and it used to read both through the same map:
+ *
+ *   `ctx.measure().shape`  is the OLD TOOLBAR's four names, where 'line' meant the multi-waypoint
+ *                          ruler. Read with `atlasModeOfLegacy`.
+ *   `measure.shape`        is what ATLAS PERSISTED, where 'line' is a RECTANGLE L×W. Read with
+ *                          `atlasShapeOf`.
+ *
+ * Reading the second through the first map turned every kept rectangle into a ruler. A ruler has
+ * no cells and no outline, so the figure lost its body, its border and its effect; its label
+ * became a bare distance ("2u" where Atlas writes "2 × 1u"); its badge showed the ruler's glyph;
+ * and the red dots that appeared were the ruler's own path nodes. Drawing a line in 3D worked —
+ * `mode()` reads the toolbar — and then the next snapshot read it back as a ruler, so the shape
+ * changed under the user's hand. `atlas/measureVocabulary.ts` now owns both maps with the
+ * direction in the name, and this file picks the door by where the data came from.
+ *
+ * Rules, token footprints, selection and speed are read from the tactical context the scene
+ * feeds the renderer. No distance is worked out here by hand: `measureRules` counts cells under
+ * the map's diagonal rule with the climb folded in once; `measureGeometry` shapes the area and
+ * says which tokens it covers.
+ *
+ * Snapping is Atlas's, in world units where a cell spans one unit. The renderer's own pick is
+ * taken UNSNAPPED so the two snaps never compose.
+ *
+ * What is kept goes to Atlas through `ctx.onAddMeasure` and comes back through `ctx.measures()`;
+ * until then it stays a local pin. A released measurement with Keep off fades over two seconds.
+ *
+ * `clearPinned()` drops only what this tool drew locally; `clearLevel()` clears the level in
+ * Atlas too, and is destructive.
+ */
+
 const FADE_MS = 2000;
 const ACTIVE_ID = 'active';
-const LEGACY_MODE: Record<string, AtlasMeasureMode> = {
-  line: 'ruler', sphere: 'circle', cone: 'cone', cube: 'square',
-};
+
 const planOf = (p: Vec3): PlanPoint => ({ x: p[0], z: p[2] });
+/** A length as the first number of a square's or line's label: cells to one decimal, no unit. */
+const tenths = (value: number): string => `${Math.round(value * 10) / 10}`;
 
 export class MeasureTool implements ToolHandler {
   private points: Vec3[] = [];
   private active = false;
   private dragStart: { x: number; y: number } | null = null;
   private dragged = false;
+  /** What this tool kept itself, for as long as Atlas is not holding it. */
   private localPins: MeasureDisplay[] = [];
   private nextPinId = 1;
+  /** The measurement released with Keep off, on its way out. */
   private fading: MeasureDisplay | null = null;
   private fadingUntil = 0;
+  /** The token a ranges measurement is drawn around. */
   private anchorId: string | null = null;
+  /** The token the press landed on, so the pick is not made twice for one gesture. */
   private downToken: string | null = null;
 
   constructor(private readonly ctx: ToolContext) {}
 
-  hasPinned(): boolean { return this.pinnedDisplays().length > 0; }
+  hasPinned(): boolean {
+    return this.pinnedDisplays().length > 0;
+  }
 
   unpin(id: string): void {
     const atlas = this.atlasMeasures().find((m) => m.id === id);
-    if (atlas) { if (this.ctx.onDeleteMeasure?.(id)) return; return; }
+    if (atlas) {
+      if (this.ctx.onDeleteMeasure?.(id)) return;
+      return;
+    }
     const next = this.localPins.filter((p) => p.id !== id);
     if (next.length === this.localPins.length) return;
     this.localPins = next;
     this.syncOverlay();
   }
 
+  /** Drops what this tool drew locally. Atlas's own measurements of the level are left alone. */
   clearPinned(): void {
     if (this.localPins.length === 0 && this.fading === null) return;
     this.localPins = [];
@@ -61,6 +110,7 @@ export class MeasureTool implements ToolHandler {
     this.syncOverlay();
   }
 
+  /** Clears the level: Atlas's kept measurements too. Destructive, and only for a Clear control. */
   clearLevel(): void {
     this.localPins = [];
     this.fading = null;
@@ -68,7 +118,9 @@ export class MeasureTool implements ToolHandler {
     this.syncOverlay();
   }
 
-  refresh(): void { this.syncOverlay(); }
+  refresh(): void {
+    this.syncOverlay();
+  }
 
   onDown(e: PointerEvent, tokenHit: string | null): void {
     this.downToken = tokenHit;
@@ -94,6 +146,7 @@ export class MeasureTool implements ToolHandler {
       this.syncOverlay();
       return;
     }
+    // Shift+click closes a leg and opens the next one, and only for a ruler.
     if (mode === 'ruler' && e.shiftKey && this.points.length < MAX_RULER_POINTS) {
       this.points[this.points.length - 1] = point;
       this.points.push(point);
@@ -130,11 +183,16 @@ export class MeasureTool implements ToolHandler {
 
   onRightClick(): boolean {
     if (!this.active) return false;
-    if (this.points.length > 2) { this.points.pop(); this.syncOverlay(); return true; }
+    if (this.points.length > 2) {
+      this.points.pop();
+      this.syncOverlay();
+      return true;
+    }
     this.cancelActive();
     return true;
   }
 
+  /** Kept for the dispatcher's waypoint entry point; the gesture is Shift+click. */
   addWaypoint(): boolean {
     if (!this.active || this.mode() !== 'ruler' || this.points.length < 2) return false;
     if (this.points.length >= MAX_RULER_POINTS) return false;
@@ -152,30 +210,52 @@ export class MeasureTool implements ToolHandler {
     this.syncOverlay();
   }
 
-  onCancel(): void { this.cancelActive(); }
-  onLeave(): void { this.downToken = null; }
+  onCancel(): void {
+    this.cancelActive();
+  }
 
-  private tactical(): TacticalOverlayContext | null { return this.ctx.view.tacticalContext(); }
+  onLeave(): void {
+    this.downToken = null;
+  }
 
+  // ---- what the scene tells us ---------------------------------------------------------------
+
+  private tactical(): TacticalOverlayContext | null {
+    return this.ctx.view.tacticalContext();
+  }
+
+  /** The rules Atlas resolves for this scene; the tool's own unit pair where the scene feeds none. */
   private rules(): AtlasMeasurementSettings {
     const fromScene = this.tactical()?.rules;
     if (fromScene) return fromScene;
     const unit = this.ctx.unit();
     return {
-      mode: 'metric', unitType: 'feet',
+      mode: 'metric',
+      unitType: 'feet',
       unitDistance: unit.distance > 0 ? unit.distance : 5,
       ruleDistance: unit.distance > 0 ? unit.distance : 5,
-      diagonalRule: 'equidistant', difficultTerrain: 'none', rangeBands: [],
-      coneAngle: 90, areaCellRule: 'half', coneEnd: 'round',
+      diagonalRule: 'equidistant',
+      difficultTerrain: 'none',
+      rangeBands: [],
+      coneAngle: 90,
+      areaCellRule: 'half',
+      coneEnd: 'round',
     };
   }
 
-  private tokens(): readonly AreaTokenTarget[] { return this.tactical()?.tokens ?? []; }
+  private tokens(): readonly AreaTokenTarget[] {
+    return this.tactical()?.tokens ?? [];
+  }
 
+  /**
+   * The mode the TOOL is in. Its `mode` is already an Atlas mode; its `shape` is the old
+   * toolbar's four-name vocabulary, so that one goes through the legacy door — where 'line'
+   * really does mean the ruler.
+   */
   private mode(): AtlasMeasureMode {
     const state = this.ctx.measure();
     if (state.mode) return state.mode;
-    return LEGACY_MODE[state.shape] ?? 'ruler';
+    return isLegacyShape(state.shape) ? atlasModeOfLegacy(state.shape) : 'ruler';
   }
 
   private widthCells(): number {
@@ -183,8 +263,11 @@ export class MeasureTool implements ToolHandler {
     return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_LINE_WIDTH_CELLS;
   }
 
-  private atlasMeasures(): readonly AtlasMeasure[] { return this.ctx.measures?.() ?? []; }
+  private atlasMeasures(): readonly AtlasMeasure[] {
+    return this.ctx.measures?.() ?? [];
+  }
 
+  /** The grid points snap to, in world units: a cell spans one unit, the layout holds the origin. */
   private snapGrid(): SnapGrid | null {
     const ctx = this.tactical();
     if (!ctx) return null;
@@ -206,6 +289,14 @@ export class MeasureTool implements ToolHandler {
     return best;
   }
 
+  // ---- picking --------------------------------------------------------------------------------
+
+  /**
+   * A point in world units. A token hit gives its LOGICAL centre — never the TileShare-offset
+   * drawing position, which would put half-cell errors into every diagonal — at the height the
+   * token layer says it stands at. Otherwise it is the terrain pick, taken unsnapped and snapped
+   * here by Atlas's own three rules.
+   */
   private pickPoint(e: MouseEvent, tokenHit: string | null, isEnd: boolean): Vec3 | null {
     const free = this.ctx.altRemove();
     const grid = this.snapGrid();
@@ -231,8 +322,12 @@ export class MeasureTool implements ToolHandler {
     return snapAreaEnd(snap, this.points[0]!, point);
   }
 
+  // ---- describing a measurement ---------------------------------------------------------------
+
   private describe(
-    points: readonly Vec3[], mode: AtlasMeasureMode, widthCells: number,
+    points: readonly Vec3[],
+    mode: AtlasMeasureMode,
+    widthCells: number,
   ): { label: string; subLabel?: string; radiusCells: number; tokenIds: string[]; legs: MeasureLeg[] } {
     const rules = this.rules();
     const origin = points[0]!;
@@ -241,6 +336,7 @@ export class MeasureTool implements ToolHandler {
     const heightSub = Math.abs(rise) >= 0.08
       ? `ΔH ${rise >= 0 ? '+' : ''}${formatGameUnits(rise * rules.unitDistance, rules)}`
       : undefined;
+
     if (mode === 'ruler') {
       const cells = pathLengthInCells(points, 1, rules.diagonalRule, rise);
       const legs: MeasureLeg[] = [];
@@ -249,7 +345,10 @@ export class MeasureTool implements ToolHandler {
           const a = points[i - 1]!;
           const b = points[i]!;
           const legCells = pathLengthInCells([a, b], 1, rules.diagonalRule, b[1] - a[1]);
-          legs.push({ label: formatDistance(legCells, rules), at: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2] });
+          legs.push({
+            label: formatDistance(legCells, rules),
+            at: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2],
+          });
         }
       }
       const parts: string[] = [];
@@ -258,21 +357,40 @@ export class MeasureTool implements ToolHandler {
       return {
         label: formatDistance(cells, rules),
         ...(parts.length > 0 && { subLabel: parts.join(' · ') }),
-        radiusCells: cells, tokenIds: [], legs,
+        radiusCells: cells,
+        tokenIds: [],
+        legs,
       };
     }
+
     if (mode === 'ranges') {
       const rings = rangeRings(rules, this.tactical()?.movement?.steps ?? [], this.tactical()?.speed ?? null);
       const outer = rings[rings.length - 1];
-      return { label: outer ? outer.label : formatReach(0, rules), radiusCells: outer?.reach ?? 0, tokenIds: [], legs: [] };
+      return {
+        label: outer ? outer.label : formatReach(0, rules),
+        radiusCells: outer?.reach ?? 0,
+        tokenIds: [],
+        legs: [],
+      };
     }
-    const shape = mode as AtlasMeasureShape;
+
+    const shape = shapeOfMode(mode);
+    if (shape === null || shape === 'ruler') {
+      return { label: '', radiusCells: 0, tokenIds: [], legs: [] };
+    }
     const area = shapedArea(shape, planOf(origin), planOf(tip), areaShapeRules(rules, widthCells), widthCells);
     const length = Math.hypot(tip[0] - origin[0], tip[2] - origin[2]);
+    // Atlas writes the unit ONCE for a square and a line: "1 × 1u", "2 × 1u". The first number is
+    // the drag in cells, the second the width or side with its unit. The live label the view draws
+    // comes from `measureRegion`; this one is kept in step so the two cannot drift apart.
     let label: string;
-    if (shape === 'square') { const side = formatDistance(length, rules); label = `${side} × ${side}`; }
-    else if (shape === 'line') { label = `${formatDistance(length, rules)} × ${formatDistance(widthCells, rules)}`; }
-    else { label = formatDistance(length, rules); }
+    if (shape === 'square') {
+      label = `${tenths(length)} × ${formatDistance(length, rules)}`;
+    } else if (shape === 'line') {
+      label = `${tenths(length)} × ${formatDistance(widthCells, rules)}`;
+    } else {
+      label = formatDistance(length, rules);
+    }
     return {
       label,
       ...(heightSub !== undefined && { subLabel: heightSub }),
@@ -292,7 +410,9 @@ export class MeasureTool implements ToolHandler {
       ? rangeRings(rules, this.tactical()?.movement?.steps ?? [], this.tactical()?.speed ?? null)
       : undefined;
     return {
-      id: ACTIVE_ID, shape: mode, mode,
+      id: ACTIVE_ID,
+      shape: mode,
+      mode,
       points: this.points.map((p) => [p[0], p[1], p[2]] as Vec3),
       radiusCells: described.radiusCells,
       label: described.label,
@@ -308,6 +428,8 @@ export class MeasureTool implements ToolHandler {
     };
   }
 
+  // ---- keeping --------------------------------------------------------------------------------
+
   private cancelActive(): void {
     if (!this.active) return;
     this.active = false;
@@ -318,6 +440,7 @@ export class MeasureTool implements ToolHandler {
     this.syncOverlay();
   }
 
+  /** Shift on release reverses Keep, as Atlas's own tool does. */
   private commit(shiftOnRelease = false): void {
     const state = this.ctx.measure();
     const mode = this.mode();
@@ -329,7 +452,10 @@ export class MeasureTool implements ToolHandler {
     this.dragStart = null;
     this.dragged = false;
     this.downToken = null;
-    if (!built || built.radiusCells <= 0.05) { this.syncOverlay(); return; }
+    if (!built || built.radiusCells <= 0.05) {
+      this.syncOverlay();
+      return;
+    }
     if (!keep) {
       this.fading = { ...built, id: `fade-${this.nextPinId++}`, fading: true };
       this.fadingUntil = Date.now() + FADE_MS;
@@ -337,19 +463,26 @@ export class MeasureTool implements ToolHandler {
       return;
     }
     const stored = this.store(mode, points, built);
-    if (!stored) this.localPins = [...this.localPins, { ...built, id: `pin-${this.nextPinId++}`, pinned: true }];
+    if (!stored) {
+      this.localPins = [...this.localPins, { ...built, id: `pin-${this.nextPinId++}`, pinned: true }];
+    }
     this.syncOverlay();
   }
 
+  /** Hands the measurement to Atlas. False when it could not be kept, and a local pin stands in. */
   private store(mode: AtlasMeasureMode, points: readonly Vec3[], built: MeasureDisplay): boolean {
     const add = this.ctx.onAddMeasure;
     const size = this.ctx.grid()?.size ?? 0;
     if (!add || !(size > 0)) return false;
-    if (!ATLAS_MEASURE_SHAPES.includes(mode as AtlasMeasureShape)) return false;
+    // `ranges` is a tool mode, not a shape Atlas persists; it stays a local pin.
+    const shape = shapeOfMode(mode);
+    if (shape === null) return false;
     const state = this.ctx.measure();
     const payload: AtlasPoint[] = points.map((p) => ({ x: p[0] * size, y: p[2] * size }));
     const id = add({
-      shape: mode as AtlasMeasureShape, points: payload, widthCells: this.widthCells(),
+      shape,
+      points: payload,
+      widthCells: this.widthCells(),
       color: state.color ?? null,
       ...(state.players !== undefined && { players: state.players }),
       ...(state.effect != null && { effect: state.effect }),
@@ -359,6 +492,8 @@ export class MeasureTool implements ToolHandler {
     return true;
   }
 
+  // ---- what Atlas already holds ---------------------------------------------------------------
+
   private surfaceAt(x: number, z: number): number {
     const ctx = this.tactical();
     if (!ctx) return 0;
@@ -366,28 +501,51 @@ export class MeasureTool implements ToolHandler {
     return ctx.map.surfaceHeightAt(x - ctx.layout.originX, z - ctx.layout.originZ, ceiling);
   }
 
+  /**
+   * One kept measurement of Atlas, as the overlay draws it.
+   *
+   * THE SHAPE IS READ THROUGH ATLAS' DOOR. `measure.shape` is what Atlas persisted, so a `line`
+   * is a rectangle and stays one. Reading it through the toolbar's legacy map turned every kept
+   * line into a ruler — no cells, no outline, no effect, a bare-distance label and the ruler's
+   * glyph — and made a rectangle drawn in 3D change shape on the next snapshot.
+   *
+   * An aura's geometry comes from its reach and the token's space, never from its stored points,
+   * which Atlas does not rewrite when the token moves. A FOLLOWER (0.18's `anchor`, no `aura`)
+   * needs no branch of its own: Atlas rewrites its points, so it reads as any drawn area.
+   */
   private keptDisplay(measure: AtlasMeasure): MeasureDisplay | null {
     const size = this.ctx.grid()?.size ?? 0;
     if (!(size > 0)) return null;
-    const mode = LEGACY_MODE[measure.shape] ?? (measure.shape as AtlasMeasureMode);
-    if (!ATLAS_MEASURE_SHAPES.includes(mode as AtlasMeasureShape) && mode !== 'ranges') return null;
+    const shape = atlasShapeOf(measure.shape);
+    if (shape === null) return null;
+    const mode: AtlasMeasureMode = shape;
     const rules = this.rules();
     const widthCells = typeof measure.width === 'number' && measure.width > 0
-      ? measure.width / size : DEFAULT_LINE_WIDTH_CELLS;
-    if (typeof measure.follows === 'string' && typeof measure.aura === 'number' && measure.aura > 0) {
+      ? measure.width / size
+      : DEFAULT_LINE_WIDTH_CELLS;
+
+    if (typeof measure.follows === 'string' && measure.follows !== ''
+      && typeof measure.aura === 'number' && measure.aura > 0) {
       const anchor = this.tokens().find((t) => t.id === measure.follows);
       if (!anchor) return null;
       const y = this.surfaceAt(anchor.x, anchor.z) + 0.02;
       return {
-        id: measure.id, shape: 'circle', mode: 'circle',
+        id: measure.id,
+        shape: 'circle',
+        mode: 'circle',
         points: [[anchor.x, y, anchor.z], [anchor.x + measure.aura / rules.unitDistance, y, anchor.z]],
         radiusCells: measure.aura / rules.unitDistance,
         label: formatReach(measure.aura / rules.unitDistance, rules),
         colorHex: measure.color ?? null,
         effect: measure.effect ?? null,
-        pinned: true, follows: measure.follows, aura: measure.aura, tokenIds: [], legs: [],
+        pinned: true,
+        follows: measure.follows,
+        aura: measure.aura,
+        tokenIds: [],
+        legs: [],
       };
     }
+
     if (!Array.isArray(measure.points) || measure.points.length < 2) return null;
     const points: Vec3[] = measure.points.map((p) => {
       const x = p.x / size;
@@ -396,13 +554,20 @@ export class MeasureTool implements ToolHandler {
     });
     const described = this.describe(points, mode, widthCells);
     return {
-      id: measure.id, shape: mode, mode, points,
+      id: measure.id,
+      shape: mode,
+      mode,
+      points,
       radiusCells: described.radiusCells,
       label: described.label,
       ...(described.subLabel !== undefined && { subLabel: described.subLabel }),
       colorHex: measure.color ?? null,
       effect: measure.effect ?? null,
-      pinned: true, tokenIds: described.tokenIds, legs: described.legs, widthCells,
+      pinned: true,
+      tokenIds: described.tokenIds,
+      legs: described.legs,
+      widthCells,
+      ...(typeof measure.follows === 'string' && measure.follows !== '' && { follows: measure.follows }),
     };
   }
 

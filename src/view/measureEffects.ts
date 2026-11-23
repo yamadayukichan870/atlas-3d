@@ -1,37 +1,59 @@
 import * as THREE from 'three';
-import type { PlanRing } from '../terrain/measureGeometry';
+import type { AreaCell, PlanRing } from '../terrain/measureGeometry';
 import type { Layout } from '../terrain/layout';
+import { quarterOf, surfaceFraction } from '../terrain/shapes';
 
 /**
  * Atlas' own animated area effects, ported to three.js.
  *
- * Verified against atlas-vtt/atlas-vtt @ tag 0.16.0:
+ * Verified against atlas-vtt/atlas-vtt @ tag 0.19.0 (the measure rules are byte-identical to
+ * 0.16.0; the six shader bodies and the drifts did not change):
  *   measure/measureEffects.ts             -> the six looks, colours, light, darkness
  *   pixi/measure/effects/effectShader.ts  -> EFFECT_CODE, uniforms, normal blending,
  *                                            premultiplied colour that may exceed alpha
- *   pixi/measure/effects/effectMotion.ts  -> per-effect drifts, EffectClock
+ *   pixi/measure/effects/effectMotion.ts  -> per-effect drifts, EffectClock,
+ *                                            EFFECT_STILL_SECONDS 23.4, MAX_STEP_MS 100
  *   pixi/liquids/liquidMotion.ts          -> MOTION_LOOP = 4096, PATTERN_TILE = 64
  *   pixi/liquids/glsl/noiseGlsl.ts        -> hash / gnoise / fbm / voronoi / spark
  *   pixi/measure/effects/glsl/*.ts        -> fire / frost / lightning / mist / radiance / shadow
+ *   pixi/measure/effects/MeasureEffectMesh.ts -> "a mesh of EXACTLY the area's polygon"
  *   pixi/measure/AreaBody.ts              -> the effect REPLACES the wash only; the cell tint
- *                                            (0.16) and the outline (0.9) still draw over it
- *   pixi/measure/effects/MeasureEffectMesh.ts -> "a mesh of exactly the area's polygon";
- *                                            nothing draws past the outline
+ *                                            (0.16) and the outline (0.9) still draw OVER it
  *
- * So the fill here is built by TRIANGULATING THE AREA'S OUTLINE RINGS, exactly as Atlas
- * triangulates its polygon — not from the covered cells. That makes it clipped to the outline by
- * construction: it cannot bleed past the border the way a per-cell fill with a soft feather did.
- * The distance-to-outline (`aEdge`) and the way-in (`aInward`) are baked per vertex, standing in
- * for Atlas' distance-field texture.
+ * THE MESH SPANS THE AREA'S POLYGON, not the covered cells. A mesh of one quad per COVERED cell
+ * filled a square inside a circle: the `half` rule leaves the outer partial cells out, so the fill
+ * stopped at the cell block while the outline ran on out to the circle. Atlas fills the polygon and
+ * paints the cell tint on top, which is why its 2D shows a circular wash with a brighter block
+ * inside it. Here the mesh covers the field's whole box, subdivided, and the distance field
+ * discards every fragment outside the outline.
  *
- * The caller (TacticalOverlays) draws this UNDER the cell tint and the outline, and draws no wash
- * and no volume shell while an effect is present — the same layering AreaBody uses.
+ * THE FIELD IS A TEXTURE, read per PIXEL. Baking it per vertex is what broke the fill once: any
+ * triangle whose three vertices lie ON the outline interpolates distance 0 across its whole face
+ * and the feather discards it entire.
+ *
+ * EVERY VERTEX TAKES ITS OWN TERRAIN HEIGHT through `heightAt`, so the fill lies on the floor
+ * everywhere inside the outline and climbs a wall face where the ground steps. A single flat quad
+ * over the box would float above the low ground beside a step and sink into a ramp; a quad AT the
+ * surface height is coplanar with the terrain's top face and fights it for the depth test in
+ * irregular patches, which reads as a broken shader rather than as z-fighting. Hence EFFECT_LIFT.
+ *
+ * THE SEED IS STABLE PER MEASUREMENT. It was `Math.random()` at every build, and a build happens
+ * on every fitted cell of a drag: write to Atlas, snapshot back, signature changed, rebuild. Each
+ * rebuild threw the whole noise field somewhere else, which read as the effect going crazy while
+ * the handle moved.
  */
 
 export type MeasureEffect = 'fire' | 'frost' | 'lightning' | 'mist' | 'radiance' | 'shadow';
+
 export const MEASURE_EFFECTS: readonly MeasureEffect[] = ['fire', 'frost', 'lightning', 'mist', 'radiance', 'shadow'];
-export const EFFECT_CODE: Readonly<Record<MeasureEffect, number>> = { fire: 0, frost: 1, lightning: 2, mist: 3, radiance: 4, shadow: 5 };
-export const MEASURE_EFFECT_STARTS: Readonly<Record<MeasureEffect, { color: string; light: 'flicker' | 'steady' | null; darkness: boolean }>> = {
+
+export const EFFECT_CODE: Readonly<Record<MeasureEffect, number>> = {
+  fire: 0, frost: 1, lightning: 2, mist: 3, radiance: 4, shadow: 5,
+};
+
+export const MEASURE_EFFECT_STARTS: Readonly<Record<MeasureEffect, {
+  color: string; light: 'flicker' | 'steady' | null; darkness: boolean;
+}>> = {
   fire: { color: '#ec7500', light: 'flicker', darkness: false },
   frost: { color: '#8ad1f8', light: null, darkness: false },
   lightning: { color: '#086ddd', light: 'flicker', darkness: false },
@@ -39,15 +61,30 @@ export const MEASURE_EFFECT_STARTS: Readonly<Record<MeasureEffect, { color: stri
   radiance: { color: '#e0ac00', light: 'steady', darkness: false },
   shadow: { color: '#7852ee', light: null, darkness: true },
 };
+
 export function readMeasureEffect(value: unknown): MeasureEffect | undefined {
   return MEASURE_EFFECTS.find((e) => e === value);
 }
 
+// ---- motion and the clock ---------------------------------------------------------------------
+
 const MOTION_LOOP = 4096;
 const PATTERN_TILE = 64;
+/** The moment an effect shows while nothing moves: past every look's first seconds. */
+export const EFFECT_STILL_SECONDS = 23.4;
+/** The longest step the clock takes between two frames: a stalled window resumes where it was. */
+const MAX_STEP_MS = 100;
+/** How far the fill floats off its surface, as the wash does. Never zero: that is z-fighting. */
+const EFFECT_LIFT = 0.018;
+/** Side of one mesh square, in cells: two samples per cell drapes a ramp without smearing it. */
+const MESH_STEP = 0.5;
+/** The most squares along one axis, so a huge area cannot build a mesh that hangs a frame. */
+const MAX_MESH_DIVISIONS = 128;
+
 const wrap = (v: number, p: number): number => v - Math.floor(v / p) * p;
 export const loopTime = (seconds: number): number => wrap(seconds, MOTION_LOOP);
 
+/** The four drifts each look reads, cells a second; up the plan is the way flames rise. */
 const DRIFTS: Readonly<Record<MeasureEffect, readonly [number, number, number, number, number, number, number, number]>> = {
   fire: [0, -0.32, 0, -0.66, 0.03, -0.13, 0.02, -0.45],
   frost: [0.022, 0.012, -0.015, 0.02, 0, 0, 0, 0],
@@ -56,12 +93,57 @@ const DRIFTS: Readonly<Record<MeasureEffect, readonly [number, number, number, n
   radiance: [0.012, -0.03, 0, 0, 0, 0, 0, 0],
   shadow: [0.045, 0.06, -0.06, 0.02, 0.05, -0.09, 0, 0],
 };
+
+/** The eight drift numbers at `seconds`, each wrapped to PATTERN_TILE. */
 export function effectDrifts(effect: MeasureEffect, seconds: number): Float32Array {
   const out = new Float32Array(8);
   const d = DRIFTS[effect];
   for (let i = 0; i < 8; i++) out[i] = wrap(d[i]! * seconds, PATTERN_TILE);
   return out;
 }
+
+/**
+ * The clock every effect of a view moves by, as Atlas' `EffectClock` is: the step between frames
+ * is capped, so a window hidden for a minute resumes where it was instead of jumping the fire a
+ * minute forward; and frames fall at `fps`, not at the display's rate.
+ *
+ * The frame gate is an interval test. Atlas delegates it to `liquidFrameDue`, whose body was not
+ * read; the cap, the still moment and the fps values are its own.
+ */
+export class EffectClock {
+  private elapsed = 0;
+  private lastTick: number | null = null;
+  private lastFrame: number | null = null;
+
+  get seconds(): number { return this.elapsed; }
+
+  tick(now: number, fps = 30): boolean {
+    if (this.lastTick !== null) {
+      this.elapsed += Math.min(Math.max(now - this.lastTick, 0), MAX_STEP_MS) / 1000;
+    }
+    this.lastTick = now;
+    if (!(fps > 0)) return false;
+    if (this.lastFrame !== null && now - this.lastFrame < 1000 / fps) return false;
+    this.lastFrame = now;
+    return true;
+  }
+
+  hold(): void { this.lastTick = null; this.lastFrame = null; }
+}
+
+/** The noise field's origin, fixed for the life of one measurement. FNV-1a over its id. */
+function seedOf(id: string | undefined): { x: number; y: number } {
+  const text = typeof id === 'string' && id !== '' ? id : 'atlas3d';
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  const g = Math.imul(h ^ 0x9e3779b9, 2246822519) >>> 0;
+  return { x: (h / 4294967296) * PATTERN_TILE, y: (g / 4294967296) * PATTERN_TILE };
+}
+
+// ---- the shared patterns, unchanged -----------------------------------------------------------
 
 const NOISE_GLSL = `
 const float LOOP = ${MOTION_LOOP.toFixed(1)};
@@ -87,6 +169,7 @@ vec3 voronoiFast(vec2 p,vec2 period,float churn){ vec2 i=floor(p); vec2 f=p-i; f
     if(dist<f1){f2=f1;f1=dist;id=h.w;} else if(dist<f2){f2=dist;} }
   f1=sqrt(f1); return vec3(f1,(sqrt(f2)-f1)*0.5,id); }
 `;
+
 const EFFECT_GLSL = `
 float hash11(float p){ p=fract(p*0.1031); p*=p+33.33; p*=p+p; return fract(p); }
 float lineNoise(float x){ float i=floor(x); float f=x-i; return mix(hash11(i),hash11(i+1.0),f*f*(3.0-2.0*f))-0.5; }
@@ -100,6 +183,7 @@ vec4 spark(vec2 q,float gap,float pace,float span){ vec2 g=q/gap; vec2 i=floor(g
   float turn=uTime*(k/LOOP)+h.y; float born=mod(floor(turn),k);
   vec2 at=0.22+0.56*hash22(site+born*vec2(0.37,0.71)); return vec4((g-i-at)*gap,fract(turn),h.z); }
 `;
+
 const FIRE_GLSL = `
 vec4 fireTurns(float one,float other){ float a=TAU*cycles(one); float b=-TAU*cycles(other); return vec4(cos(a),sin(a),cos(b),sin(b)); }
 vec4 fireDoubled(vec4 t){ return vec4(t.x*t.x-t.y*t.y,2.0*t.x*t.y,t.z*t.z-t.w*t.w,2.0*t.z*t.w); }
@@ -154,6 +238,7 @@ vec4 fire(vec2 p,float d,float px){
   lit+=vec4(bright*sparks,sparks*0.7);
   return lit; }
 `;
+
 const FROST_GLSL = `
 float glint(vec2 p,float px){ vec4 s=spark(p,0.8,900.0,1100.0); if(s.w>0.5)return 0.0;
   float life=smoothstep(0.0,0.12,s.z)*(1.0-smoothstep(0.16,0.42,s.z));
@@ -162,7 +247,6 @@ float glint(vec2 p,float px){ vec4 s=spark(p,0.8,900.0,1100.0); if(s.w>0.5)retur
   arms+=max(0.0,1.0-a.y/reach)*max(0.0,1.0-a.x/(reach*0.12+px));
   float heart=1.0-smoothstep(0.0,reach*0.25+px,length(s.xy));
   return life*min(1.0,arms*arms+heart)*shown(0.05,px); }
-vec2 frostInward(){ return vIn; }
 vec4 frostOver(vec4 under,vec3 colour,float cover){ return under*(1.0-cover)+vec4(colour*cover,cover); }
 vec4 frost(vec2 p,float d,float px){
   int octaves=uDetail>1.5?3:2; bool rich=uDetail>0.5; int soft=rich?2:1;
@@ -207,6 +291,7 @@ vec4 frost(vec2 p,float d,float px){
   lit+=vec4(vec3(1.0)*star*0.9,star*0.5);
   return lit; }
 `;
+
 const LIGHTNING_GLSL = `
 const float STRIKE_JUMPS=4.0;
 float narrowness(){ return clamp((TAU*0.5-uSpread)/(TAU*0.5-0.2),0.0,1.0); }
@@ -258,6 +343,7 @@ vec4 lightning(vec2 p,float d,float px){
   vec3 colour=deepened(1.3)*0.5*charged+uTint*charged*0.3+mix(uTint,lifted(0.25),halo*halo)*halo*0.85+lifted(0.9)*heart;
   return vec4(colour,alpha); }
 `;
+
 const MIST_GLSL = `
 vec4 mist(vec2 p,float d,float px){
   int octaves=uDetail>1.5?3:2; vec2 roll=vec2(0.0);
@@ -270,6 +356,7 @@ vec4 mist(vec2 p,float d,float px){
   vec3 colour=mix(uTint*vec3(0.38,0.42,0.5),lifted(0.3)*0.96,smoothstep(0.15,0.85,bank));
   return vec4(colour*alpha,alpha); }
 `;
+
 const RADIANCE_GLSL = `
 vec4 radiance(vec2 p,float d,float px){
   float r=length(p); float turn=atan(p.y,p.x)/TAU;
@@ -292,6 +379,7 @@ vec4 radiance(vec2 p,float d,float px){
     lit+=vec4(lifted(0.8)*mote*0.8,mote*0.4); }
   return lit; }
 `;
+
 const SHADOW_GLSL = `
 vec4 shadow(vec2 p,float d,float px){
   float middle=inward(d,1.4); float within=inward(d,0.35);
@@ -312,37 +400,44 @@ vec4 shadow(vec2 p,float d,float px){
 `;
 
 const VERTEX = `
-attribute float aEdge;
-attribute vec2 aInward;
+varying vec2 vP;
+varying vec2 vUv;
 uniform vec2 uShift;
 uniform float uCell;
-varying vec2 vP;
-varying float vD;
-varying vec2 vIn;
 void main(){
   vP = (position.xz + uShift) / uCell;
-  vD = aEdge;
-  vIn = aInward;
+  vUv = uv;
   gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
 }`;
+
 const FRAGMENT = `
 precision highp float;
-uniform float uTime, uCell, uEffect, uDepth, uSpread, uReach, uDetail, uStill;
+uniform float uTime, uCell, uEffect, uDepth, uSpread, uReach, uDetail, uStill, uFade;
 uniform vec3 uTint;
 uniform vec2 uSeed;
 uniform vec4 uFrame, uDriftA, uDriftB;
+uniform sampler2D uField;
+uniform vec2 uFieldSize;
 varying vec2 vP;
-varying float vD;
-varying vec2 vIn;
+varying vec2 vUv;
 ${NOISE_GLSL}
 ${EFFECT_GLSL}
+float fieldAt(vec2 uv){ return texture2D(uField, uv).r * uDepth; }
+float edgeDistance(){ return fieldAt(vUv); }
+vec2 frostInward(){
+  vec2 hop = 1.0 / uFieldSize;
+  float gx = fieldAt(vUv + vec2(hop.x, 0.0)) - fieldAt(vUv - vec2(hop.x, 0.0));
+  float gy = fieldAt(vUv + vec2(0.0, hop.y)) - fieldAt(vUv - vec2(0.0, hop.y));
+  vec2 up = vec2(gx, gy);
+  float len = length(up);
+  return len > 1e-5 ? up / len : vec2(0.0, 1.0);
+}
 ${FIRE_GLSL}
 ${FROST_GLSL}
 ${LIGHTNING_GLSL}
 ${MIST_GLSL}
 ${RADIANCE_GLSL}
 ${SHADOW_GLSL}
-float edgeDistance(){ return vD; }
 void main(){
   vec2 p = vP;
   float px = max(length(fwidth(p)) * 0.7071, 1e-5);
@@ -355,14 +450,21 @@ void main(){
     : uEffect < 3.5 ? mist(p, d, px)
     : uEffect < 4.5 ? radiance(p, d, px)
     : shadow(p, d, px);
-  gl_FragColor = colour * feather;
+  gl_FragColor = colour * feather * uFade;
 }`;
+
+// ---- what a built effect exposes ---------------------------------------------------------------
 
 export interface EffectFill {
   readonly group: THREE.Group;
   setTime(seconds: number): void;
+  /** Hold the moment Atlas shows when nothing moves (reduced motion, maps not animated). */
+  setStill(still: boolean): void;
+  /** How much of the look shows, 0..1, so a released measurement fades instead of popping. */
+  setFade(factor: number): void;
   dispose(): void;
 }
+
 export interface EffectFillOptions {
   readonly effect: MeasureEffect;
   readonly color: string;
@@ -372,83 +474,122 @@ export interface EffectFillOptions {
   readonly towards?: { x: number; z: number };
   readonly spread?: number;
   readonly depth?: number;
-  /** The height the fill lies at (the surface it is painted on). */
+  /** Where the fill lies when neither `heightAt` nor `cells` say. */
   readonly baseY?: number;
+  /** The covered cells: a height fallback where `heightAt` is not given. */
+  readonly cells?: readonly AreaCell[];
+  readonly layerHeight?: number;
+  /** The measurement's id, which fixes its noise field for its whole life. */
+  readonly seed?: string;
+  /**
+   * The terrain's own surface height at a plan point, under the slice. Given, the fill lies on
+   * the floor everywhere inside the outline — including the parts no cell covers, which is what
+   * makes it fill the whole circle instead of the covered block.
+   */
+  readonly heightAt?: (x: number, z: number) => number;
 }
 
-function distToSegment(px: number, pz: number, ax: number, az: number, bx: number, bz: number): number {
-  const dx = bx - ax, dz = bz - az;
+interface FieldEdge { ax: number; az: number; bx: number; bz: number }
+
+function distToEdge(px: number, pz: number, e: FieldEdge): number {
+  const dx = e.bx - e.ax, dz = e.bz - e.az;
   const l2 = dx * dx + dz * dz;
-  const t = l2 === 0 ? 0 : Math.min(1, Math.max(0, ((px - ax) * dx + (pz - az) * dz) / l2));
-  return Math.hypot(px - (ax + dx * t), pz - (az + dz * t));
+  const t = l2 === 0 ? 0 : Math.min(1, Math.max(0, ((px - e.ax) * dx + (pz - e.az) * dz) / l2));
+  return Math.hypot(px - (e.ax + dx * t), pz - (e.az + dz * t));
+}
+
+function pointInRing(px: number, pz: number, ring: PlanRing): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const a = ring[i]!, b = ring[j]!;
+    if ((a.z > pz) !== (b.z > pz) && px < ((b.x - a.x) * (pz - a.z)) / (b.z - a.z) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
+interface DistanceField {
+  texture: THREE.DataTexture;
+  x0: number; z0: number; w: number; h: number;
+  depth: number; res: number;
+}
+
+/** The distance to the outline as a texture: positive inside, zero on and outside it, in cells. */
+function buildDistanceField(rings: readonly PlanRing[]): DistanceField | null {
+  const usable = rings.filter((r) => Array.isArray(r) && r.length > 2);
+  if (usable.length === 0) return null;
+  let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  const edges: FieldEdge[] = [];
+  for (const ring of usable) {
+    for (let i = 0; i < ring.length; i++) {
+      const a = ring[i]!, b = ring[(i + 1) % ring.length]!;
+      edges.push({ ax: a.x, az: a.z, bx: b.x, bz: b.z });
+      x0 = Math.min(x0, a.x); x1 = Math.max(x1, a.x);
+      z0 = Math.min(z0, a.z); z1 = Math.max(z1, a.z);
+    }
+  }
+  if (!Number.isFinite(x0) || edges.length === 0) return null;
+  const pad = 0.5;
+  x0 -= pad; z0 -= pad; x1 += pad; z1 += pad;
+  const w = x1 - x0, h = z1 - z0;
+  if (!(w > 0) || !(h > 0)) return null;
+  const res = Math.max(64, Math.min(256, Math.ceil(Math.max(w, h) * 14)));
+  const data = new Uint8Array(res * res * 4);
+  const dist = new Float32Array(res * res);
+  let maxD = 0;
+  for (let j = 0; j < res; j++) {
+    const pz = z0 + ((j + 0.5) / res) * h;
+    for (let i = 0; i < res; i++) {
+      const px = x0 + ((i + 0.5) / res) * w;
+      let inside = pointInRing(px, pz, usable[0]!);
+      for (let k = 1; k < usable.length && inside; k++) if (pointInRing(px, pz, usable[k]!)) inside = false;
+      let d = 0;
+      if (inside) {
+        d = Infinity;
+        for (const e of edges) { const q = distToEdge(px, pz, e); if (q < d) d = q; }
+        if (!Number.isFinite(d)) d = 0;
+      }
+      dist[j * res + i] = d;
+      if (d > maxD) maxD = d;
+    }
+  }
+  const depth = Math.max(maxD, 0.05);
+  for (let k = 0; k < res * res; k++) {
+    const v = Math.round(Math.min(1, dist[k]! / depth) * 255);
+    data[k * 4] = v; data[k * 4 + 1] = v; data[k * 4 + 2] = v; data[k * 4 + 3] = 255;
+  }
+  const texture = new THREE.DataTexture(data, res, res, THREE.RGBAFormat);
+  texture.magFilter = THREE.LinearFilter;
+  texture.minFilter = THREE.LinearFilter;
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.needsUpdate = true;
+  return { texture, x0, z0, w, h, depth, res };
 }
 
 /**
- * The animated body of one area, as a mesh of EXACTLY its outline polygon (Atlas'
- * MeasureEffectMesh), triangulated with ear-clipping so a stepped or reflex ring is filled
- * correctly and nothing lies past the border. `aEdge` is the distance to the outline (0 on it),
- * `aInward` the way into the area, standing in for Atlas' distance-field texture.
+ * The animated body of one area: a mesh over the WHOLE outline, subdivided and draped on the
+ * terrain, the distance field discarding everything outside it. The covered cells are not the
+ * mesh any more — they are only a height fallback — so the fill reaches the outline exactly as
+ * Atlas' own does, and the cell tint the caller paints on top reads as cells over the fire.
+ *
+ * A malformed call returns null rather than throwing: a throw here aborts the caller's whole
+ * pass and blanks every measurement, which is what a mismatched signature once did.
  */
 export function buildEffectFill(rings: readonly PlanRing[], opts: EffectFillOptions): EffectFill | null {
-  const usable = rings.filter((r) => r.length > 2);
-  if (usable.length === 0) return null;
-  const contour = usable[0]!;
-  const holes = usable.slice(1);
-  const toV2 = (r: PlanRing): THREE.Vector2[] => r.map((p) => new THREE.Vector2(p.x, p.z));
-  let tris: number[][];
-  try {
-    tris = THREE.ShapeUtils.triangulateShape(toV2(contour), holes.map(toV2));
-  } catch {
-    return null;
-  }
-  if (tris.length === 0) return null;
-
-  // All boundary edges, for the per-vertex distance and way-in.
-  const edges: { ax: number; az: number; bx: number; bz: number }[] = [];
-  for (const r of usable) {
-    for (let i = 0; i < r.length; i++) {
-      const a = r[i]!, b = r[(i + 1) % r.length]!;
-      edges.push({ ax: a.x, az: a.z, bx: b.x, bz: b.z });
-    }
-  }
-  let cx = 0, cz = 0;
-  for (const p of contour) { cx += p.x; cz += p.z; }
-  cx /= contour.length; cz /= contour.length;
-
-  const baseY = opts.baseY ?? 0;
-  const pos: number[] = []; const edge: number[] = []; const inward: number[] = [];
-  let depth = 0;
-  const push = (p: { x: number; z: number }): void => {
-    let best = Infinity; let bx = p.x; let bz = p.z;
-    for (const e of edges) {
-      const dx = e.bx - e.ax, dz = e.bz - e.az;
-      const l2 = dx * dx + dz * dz;
-      const t = l2 === 0 ? 0 : Math.min(1, Math.max(0, ((p.x - e.ax) * dx + (p.z - e.az) * dz) / l2));
-      const qx = e.ax + dx * t, qz = e.az + dz * t;
-      const d = Math.hypot(p.x - qx, p.z - qz);
-      if (d < best) { best = d; bx = qx; bz = qz; }
-    }
-    depth = Math.max(depth, best);
-    let ix = cx - bx, iz = cz - bz;
-    const il = Math.hypot(ix, iz);
-    if (il > 1e-6) { ix /= il; iz /= il; } else { ix = 0; iz = 1; }
-    pos.push(p.x, baseY, p.z); edge.push(best); inward.push(ix, iz);
-  };
-  for (const t of tris) {
-    push(contour[t[0]!]!); push(contour[t[1]!]!); push(contour[t[2]!]!);
-  }
-
-  const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  geom.setAttribute('aEdge', new THREE.Float32BufferAttribute(edge, 1));
-  geom.setAttribute('aInward', new THREE.Float32BufferAttribute(inward, 2));
+  if (!Array.isArray(rings) || typeof opts !== 'object' || opts === null) return null;
+  const effect = opts.effect;
+  if (typeof effect !== 'string' || !(effect in EFFECT_CODE)) return null;
+  if (typeof opts.color !== 'string' || typeof opts.origin !== 'object' || opts.origin === null) return null;
+  const field = buildDistanceField(rings);
+  if (!field) return null;
 
   const tint = new THREE.Color(opts.color).convertLinearToSRGB();
   const towards = opts.towards ?? { x: 1, z: 0 };
+  const seed = seedOf(opts.seed);
   const uniforms = {
     uTime: { value: 0 },
     uCell: { value: 1 },
-    uEffect: { value: EFFECT_CODE[opts.effect] },
+    uEffect: { value: EFFECT_CODE[effect] },
     uTint: { value: new THREE.Vector3(tint.r, tint.g, tint.b) },
     uShift: { value: new THREE.Vector2(-opts.origin.x, -opts.origin.z) },
     uFrame: { value: new THREE.Vector4(0, 0, towards.x, towards.z) },
@@ -456,33 +597,104 @@ export function buildEffectFill(rings: readonly PlanRing[], opts: EffectFillOpti
     uReach: { value: Math.max(0.5, opts.reach) },
     uDriftA: { value: new THREE.Vector4() },
     uDriftB: { value: new THREE.Vector4() },
-    uSeed: { value: new THREE.Vector2(Math.random() * 64, Math.random() * 64) },
+    uSeed: { value: new THREE.Vector2(seed.x, seed.y) },
     uDetail: { value: 2 },
     uStill: { value: 0 },
-    uDepth: { value: Math.max(0.5, opts.depth ?? depth) },
+    uFade: { value: 1 },
+    uDepth: { value: Math.max(0.05, opts.depth ?? field.depth) },
+    uField: { value: field.texture },
+    uFieldSize: { value: new THREE.Vector2(field.res, field.res) },
   };
+
   const mat = new THREE.ShaderMaterial({
     uniforms, vertexShader: VERTEX, fragmentShader: FRAGMENT,
     transparent: true, depthWrite: false, side: THREE.DoubleSide,
     blending: THREE.NormalBlending, premultipliedAlpha: true,
   });
+
+  // Height fallback where the caller gave no terrain query: the nearest covered cell's surface,
+  // ramp-aware. Flat ground is exact; a step is approximated until `heightAt` is passed.
+  const cells = Array.isArray(opts.cells) ? opts.cells.filter((c) => c && Number.isFinite(c.y)) : [];
+  const layerHeight = opts.layerHeight ?? 1;
+  const layout = opts.layout;
+  const cellY = (c: AreaCell, x: number, z: number): number => {
+    if (!c.slope || !layout) return c.y;
+    const q = quarterOf(c.slope.rot);
+    const baseX = layout.originX + c.cx;
+    const baseZ = layout.originZ + c.cz;
+    const u = Math.min(1, Math.max(0, x - baseX));
+    const v = Math.min(1, Math.max(0, z - baseZ));
+    const midF = surfaceFraction(c.slope.shape, q, (c.x0 + c.x1) / 2 - baseX, (c.z0 + c.z1) / 2 - baseZ);
+    return c.y + (surfaceFraction(c.slope.shape, q, u, v) - midF) * layerHeight;
+  };
+  const fallbackY = (x: number, z: number): number => {
+    let best: AreaCell | null = null;
+    let bestD = Infinity;
+    for (const c of cells) {
+      const d = Math.hypot((c.x0 + c.x1) / 2 - x, (c.z0 + c.z1) / 2 - z);
+      if (d < bestD) { bestD = d; best = c; }
+    }
+    return best ? cellY(best, x, z) : (opts.baseY ?? 0);
+  };
+  const yAt = (x: number, z: number): number =>
+    (opts.heightAt ? opts.heightAt(x, z) : fallbackY(x, z)) + EFFECT_LIFT;
+
+  // A grid over the field's box, two samples per cell, each vertex at its own terrain height.
+  const nx = Math.max(2, Math.min(MAX_MESH_DIVISIONS, Math.ceil(field.w / MESH_STEP)));
+  const nz = Math.max(2, Math.min(MAX_MESH_DIVISIONS, Math.ceil(field.h / MESH_STEP)));
+  const sx = field.w / nx;
+  const sz = field.h / nz;
+  const pos: number[] = [];
+  const uvs: number[] = [];
+  const push = (x: number, z: number): void => {
+    pos.push(x, yAt(x, z), z);
+    uvs.push((x - field.x0) / field.w, (z - field.z0) / field.h);
+  };
+  for (let j = 0; j < nz; j++) {
+    const z0 = field.z0 + j * sz;
+    const z1 = z0 + sz;
+    for (let i = 0; i < nx; i++) {
+      const x0 = field.x0 + i * sx;
+      const x1 = x0 + sx;
+      push(x0, z0); push(x1, z0); push(x1, z1);
+      push(x0, z0); push(x1, z1); push(x0, z1);
+    }
+  }
+
+  if (pos.length === 0) { field.texture.dispose(); mat.dispose(); return null; }
+
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
   const mesh = new THREE.Mesh(geom, mat);
+  // Under the cell tint (2.5) and the outline (2.6), as AreaBody layers them.
   mesh.renderOrder = 2.4;
   const group = new THREE.Group();
   group.add(mesh);
 
+  const apply = (seconds: number, still: boolean): void => {
+    uniforms.uTime.value = loopTime(seconds);
+    uniforms.uStill.value = still ? 1 : 0;
+    const d = effectDrifts(effect, seconds);
+    uniforms.uDriftA.value.set(d[0]!, d[1]!, d[2]!, d[3]!);
+    uniforms.uDriftB.value.set(d[4]!, d[5]!, d[6]!, d[7]!);
+  };
+
   return {
     group,
-    setTime(seconds: number): void {
-      uniforms.uTime.value = loopTime(seconds);
-      const d = effectDrifts(opts.effect, seconds);
-      uniforms.uDriftA.value.set(d[0]!, d[1]!, d[2]!, d[3]!);
-      uniforms.uDriftB.value.set(d[4]!, d[5]!, d[6]!, d[7]!);
+    setTime(seconds: number): void { apply(seconds, false); },
+    setStill(still: boolean): void {
+      if (still) apply(EFFECT_STILL_SECONDS, true);
+      else uniforms.uStill.value = 0;
+    },
+    setFade(factor: number): void {
+      uniforms.uFade.value = Math.min(1, Math.max(0, factor));
     },
     dispose(): void {
       group.removeFromParent();
       geom.dispose();
       mat.dispose();
+      field.texture.dispose();
     },
   };
 }

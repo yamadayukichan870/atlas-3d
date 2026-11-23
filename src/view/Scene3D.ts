@@ -54,17 +54,20 @@ import { TextureLoader } from './textures';
  *
  * TWO HANDLES, both Atlas' own, wired here:
  *
- *   the badge on a token's rim  -> `binding.openMeasurePopover(id)`, which is Atlas' store action
- *                                  (`stores/uiSlice.ts`), so the panel that opens is Atlas' own.
- *   the dot on the outline      -> a reach in cells, turned here into what Atlas stores: an aura's
- *                                  game units and the points it then holds (`auraPoints`), or an
- *                                  area's moved end. Verified against `measure/auraArea.ts` and
- *                                  `measure/measureMove.ts` @ tag 0.16.0.
+ *   the badge on a token's rim  -> `binding.openMeasurePopover(id)`, Atlas' store action, so the
+ *                                  panel that opens is Atlas' own. The accent ring around that
+ *                                  badge is fed back from `binding.measurePopoverId()` on every
+ *                                  snapshot, so it follows Atlas even when Atlas closes the panel
+ *                                  on a store change we never saw.
+ *   the dot on the outline      -> a reach in cells AND the way the pointer lies from the anchor.
+ *                                  The direction is what lets the handle be carried AROUND the
+ *                                  area, and the turn dot turn it, instead of only sliding along
+ *                                  the way it already lay.
  *
- * THE MEASURE BAR is Atlas' six modes, not the legacy four. The toolbar's mode / Players / line-width
- * controls are wired here to `binding.setMeasureTool`, the same store action Atlas' own bar writes,
- * so choosing a mode in 3D moves Atlas' bar and vice versa. The Grid button reflects the EFFECTIVE
- * visibility (our toggle AND Atlas' grid.enabled), so it never claims a grid that is not drawn.
+ * `lifts` travels with the measure context: each token's elevation above its own floor, in world
+ * units, the same conversion `applyTokens` uses. It is what will let the view tell a token inside
+ * an area's FOOTPRINT from one its VOLUME actually reaches — a flier 15ft up is in a ground cube's
+ * footprint but out of its effect, and only the lift can say so.
  *
  * Selection is a set, not a single id: the Select (N) button of a measured area selects every token
  * inside it, in Atlas itself. The first of the set is what the camera and the HUD follow.
@@ -137,16 +140,11 @@ function resolveGridStyle(grid: AtlasGrid): GridStyle {
 
 function panDirectionOf(key: string): PanDirection | null {
   switch (key.toLowerCase()) {
-    case 'arrowup':
-      return 'up';
-    case 'arrowdown':
-      return 'down';
-    case 'arrowleft':
-      return 'left';
-    case 'arrowright':
-      return 'right';
-    default:
-      return null;
+    case 'arrowup': return 'up';
+    case 'arrowdown': return 'down';
+    case 'arrowleft': return 'left';
+    case 'arrowright': return 'right';
+    default: return null;
   }
 }
 
@@ -167,11 +165,7 @@ function isTokenDefeated(token: AtlasToken): boolean {
   return hp !== undefined && hp.max > 0 && hp.current <= 0;
 }
 
-/**
- * The legacy four-name shape the toolbar's fallback still speaks, for an Atlas mode. `ruler` and
- * `line` both land on 'line' because the old union has no room for both; `measure.mode` carries the
- * real one, and the six-name bar reads that.
- */
+/** The legacy four-name shape the toolbar's fallback still speaks, for an Atlas mode. */
 function legacyShapeOf(mode: AtlasMeasureMode): AoEShape {
   switch (mode) {
     case 'circle': return 'sphere';
@@ -220,7 +214,6 @@ export class Scene3D extends Component {
   private readonly binding = new AtlasBinding((snapshot) => this.onScene(snapshot));
   private readonly textures: TextureLoader;
   private followed: WorkspaceLeaf | null = null;
-
   private terrain = new BlockMap();
   private sceneKey: string | null = null;
   private background: string | null = null;
@@ -265,7 +258,6 @@ export class Scene3D extends Component {
     const { host, embedded } = this.opts;
     this.stage = host.createDiv({ cls: embedded ? 'atlas3d-stage is-embedded' : 'atlas3d-stage' });
     this.stage.tabIndex = -1;
-
     const scene = this;
     this.renderer = new SceneRenderer(this.stage, {
       get map() { return scene.terrain; },
@@ -274,7 +266,6 @@ export class Scene3D extends Component {
     this.renderer.onSelectTokens = (ids) => this.selectMany(ids);
     this.renderer.onOpenMeasurePopover = (id) => this.openMeasureOptions(id);
     this.renderer.onMeasureResize = (change) => this.resizeMeasure(change);
-
     this.toolbar = new Toolbar(this.stage, {
       onTool: (tool) => this.setTool(tool),
       onBrush: (size) => { this.interaction.brush = size; this.toolbar.setBrush(size); },
@@ -299,14 +290,12 @@ export class Scene3D extends Component {
       onExit: this.opts.onExit,
       onDock: this.opts.onDock ? () => this.opts.onDock?.(this.followed) : undefined,
     });
-
     this.buildDock = new BuildDock(this.stage, {
       onMode: (mode) => this.setBuild({ mode }),
       onShape: (shape) => this.setBuild({ shape }),
       onRotate: () => this.turnPiece(1),
       onColor: (top) => this.setBuild({ top }),
     });
-
     this.tokenHud = new TokenHud(this.stage, {
       onStepResource: (id, key, delta) => { this.binding.stepResource(id, key, delta); },
       onStepElevation: (id, delta) => this.stepTokenElevation(id, delta),
@@ -317,9 +306,7 @@ export class Scene3D extends Component {
       onToggleFlip: (id) => this.toggleTokenFlip(id),
       onSetFacing: (id, facing) => this.setTokenFacing(id, facing),
     });
-
     this.terrainInfo = new TerrainInfoWidget(this.stage);
-
     this.interaction = new Interaction(this.renderer, {
       map: () => this.terrain,
       build: () => this.build,
@@ -353,27 +340,22 @@ export class Scene3D extends Component {
       onMeasureTool: (updates) => this.binding.setMeasureTool(updates),
       onSetTokenAuras: (auras, look) => this.binding.setTokenAuras(auras, look),
     });
-
     this.buildDock.setBuild(this.build);
     this.toolbar.setMeasureState(this.measure, this.measurePinCount);
     this.syncTerrainUi();
     this.renderer.onFrame = () => this.refreshHud();
-
     const observer = new ResizeObserver(() => {
       this.renderer.resize();
       if (embedded) this.scheduleSafeAreaSync();
     });
     observer.observe(this.stage);
     this.register(() => observer.disconnect());
-
     if (embedded) this.setupChromeSafeArea(host);
-
     this.registerDomEvent(this.stage, 'pointerdown', () => this.stage.focus({ preventScroll: true }));
     this.registerDomEvent(this.stage, 'keydown', (event: KeyboardEvent) => this.onKey(event));
     this.registerDomEvent(this.stage, 'keyup', (event: KeyboardEvent) => this.onKeyUp(event));
     this.registerDomEvent(this.stage, 'blur', () => this.clearInputState());
     this.registerDomEvent(this.stage.win, 'blur', () => this.clearInputState());
-
     if (this.opts.embedded) {
       this.follow(this.opts.leaf);
     } else {
@@ -400,11 +382,9 @@ export class Scene3D extends Component {
   }
 
   // ---- embedded safe area --------------------------------------------------------------------
-
   private setupChromeSafeArea(host: HTMLElement): void {
     const viewEl = host.parentElement;
     if (!viewEl) return;
-
     const mutation = new MutationObserver(() => this.scheduleSafeAreaSync());
     mutation.observe(viewEl, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class', 'hidden'] });
     this.register(() => mutation.disconnect());
@@ -424,25 +404,21 @@ export class Scene3D extends Component {
     if (!viewEl) return;
     const frame = viewEl.getBoundingClientRect();
     if (frame.width === 0) return;
-
     // The three class names are Atlas's own chrome, read from the one list the diagnostic watches:
     // a release that renames them is reported there instead of silently moving the toolbar.
     const [startSel, endSel, levelSel] = ATLAS_CHROME_SELECTORS;
     const startEl = startSel ? viewEl.querySelector(startSel) as HTMLElement | null : null;
     const endEl = endSel ? viewEl.querySelector(endSel) as HTMLElement | null : null;
     const levelEl = levelSel ? viewEl.querySelector(levelSel) as HTMLElement | null : null;
-
     const startRect = startEl ? startEl.getBoundingClientRect() : null;
     const endRect = endEl ? endEl.getBoundingClientRect() : null;
     const leftReserve = startRect && startRect.width > 0 ? Math.max(8, Math.ceil(startRect.right - frame.left + 8)) : 8;
     const rightReserve = endRect && endRect.width > 0 ? Math.max(8, Math.ceil(frame.right - endRect.left + 8)) : 8;
-
     const firstGroup = this.toolbar.el.firstElementChild as HTMLElement | null;
     const groupsWidth = Array.from(this.toolbar.el.children)
       .filter((el) => !el.hasClass('is-hidden') && el !== this.toolbar.el.lastElementChild)
       .reduce((sum, el) => sum + (el as HTMLElement).offsetWidth + 8, 0) || (firstGroup?.offsetWidth ?? 420);
     const availableMiddle = frame.width - leftReserve - rightReserve;
-
     if (availableMiddle >= groupsWidth || !startRect || startRect.height === 0) {
       this.stage.style.setProperty('--atlas3d-tb-top', '8px');
       this.stage.style.setProperty('--atlas3d-tb-left', `${leftReserve}px`);
@@ -453,7 +429,6 @@ export class Scene3D extends Component {
       this.stage.style.setProperty('--atlas3d-tb-left', '8px');
       this.stage.style.setProperty('--atlas3d-tb-right', `${rightReserve}px`);
     }
-
     const levelRect = levelEl ? levelEl.getBoundingClientRect() : null;
     const dockLeft = levelRect && levelRect.width > 0 ? Math.ceil(levelRect.right - frame.left + 10) : 8;
     const tbBottom = Math.ceil(this.toolbar.el.getBoundingClientRect().bottom - frame.top + 8);
@@ -462,7 +437,6 @@ export class Scene3D extends Component {
   }
 
   // ---- following Atlas -----------------------------------------------------------------------
-
   private follow(leaf: WorkspaceLeaf | null): void {
     if (leaf === null) {
       this.binding.detach();
@@ -530,9 +504,24 @@ export class Scene3D extends Component {
   }
 
   /**
+   * Each token's elevation above its own floor, in world units — the same conversion `applyTokens`
+   * uses. The overlay adds it to the terrain floor it samples to separate the footprint (Atlas'
+   * cells) from the volume's reach (our spatial reading).
+   */
+  private tokenLifts(): Record<string, number> {
+    const unit = this.rules().unitDistance;
+    const distance = unit > 0 ? unit : 1;
+    const out: Record<string, number> = {};
+    for (const token of this.tokensById.values()) {
+      out[token.id] = (token.elevation ?? 0) / distance;
+    }
+    return out;
+  }
+
+  /**
    * Feeds the tactical layer what it needs to measure as Atlas does: the collection's rules, the
-   * logical footprints, the selection, the map's Snap, and the speed of the token the ranges would
-   * be drawn around. Snap is what tells a dragged reach whether it fits to whole cells or tenths.
+   * logical footprints, the selection, the map's Snap, each token's lift, and the speed of the
+   * token the ranges would be drawn around.
    */
   private syncMeasureContext(): void {
     const rules = this.rulesCache ??= this.binding.sceneRules();
@@ -543,18 +532,14 @@ export class Scene3D extends Component {
       selectedIds: [...this.selectedIds],
       speed: this.selectedId !== null ? this.binding.tokenSpeed(this.selectedId) : null,
       snapToGrid: this.snapshot?.grid?.snapToGrid !== false,
+      lifts: this.tokenLifts(),
     });
   }
 
   // ---- Atlas' own measurement handles ---------------------------------------------------------
-
   /**
    * The badge on a token's rim was pressed: open Atlas' OWN options popover. Nothing of ours is
    * drawn — the panel is Atlas', so it looks like the rest of Atlas and keeps up with its releases.
-   *
-   * `binding.openMeasurePopover` checks what Atlas' own guard checks before asking (the measurement
-   * is on the level shown, the view is the GM's of a loaded scene) and reads the field back, so a
-   * false answer means no panel opened rather than a write that silently did nothing.
    *
    * Where the panel appears is Atlas's choice: it anchors it to the measurement's handle in ITS OWN
    * view. Inside an Atlas tab that is the same window; in the separate 3D pane it is the Atlas tab.
@@ -570,18 +555,17 @@ export class Scene3D extends Component {
   }
 
   /**
-   * The far handle was dragged to a new reach, in cells. Turned into what Atlas stores, by Atlas'
-   * own formulas (`measure/auraArea.ts` auraPoints / auraOfCells, `measure/measureMove.ts`
-   * areaResizedBy), and written through `updateMeasure` so 2D and 3D move together and Atlas saves it.
+   * A far handle was dragged to a new reach, in cells, and possibly to a new way round. Turned into
+   * what Atlas stores by Atlas' own formulas and written through `updateMeasure`, so 2D and 3D move
+   * together and Atlas saves it.
+   *
+   * The handle's own DIRECTION is used when the drag named one: that is what lets the far dot be
+   * carried around the area, and the turn dot turn it, instead of only sliding along the way it
+   * already lay. Where the drag named none, the measurement's stored way stands.
    *
    * An aura's reach is game units from the EDGE of its token's space, and the two points it holds
    * are a snapshot of where it then lies — Atlas never rewrites them when the token moves, which is
    * why the geometry always comes from the reach and the token's space, never from those points.
-   * They are written here anyway, as Atlas writes them whenever the aura itself is edited, so its
-   * own 2D handle stands where the 3D one does.
-   *
-   * An area keeps its origin and moves its far end along its own direction. The overlay already
-   * fitted the length to whole cells (or tenths with Alt / Snap off), so no second snap is applied.
    */
   private resizeMeasure(change: MeasureResize): void {
     const snapshot = this.snapshot;
@@ -594,10 +578,9 @@ export class Scene3D extends Component {
     if (!measure) return;
     const cells = Number.isFinite(change.cells) ? change.cells : 0;
     if (!(cells > 0)) return;
-
     const unit = this.rules().unitDistance;
     const distance = unit > 0 ? unit : 1;
-    const direction = directionOf(measure.points);
+    const direction = change.direction ?? directionOf(measure.points);
     const isAura = typeof measure.follows === 'string' && measure.follows !== ''
       && typeof measure.aura === 'number' && measure.aura > 0;
 
@@ -638,7 +621,6 @@ export class Scene3D extends Component {
       return;
     }
     this.rulesCache = this.binding.sceneRules();
-
     const key = snapshot.levelId ? `${snapshot.mapPath}::${snapshot.levelId}` : snapshot.mapPath;
     const sceneChanged = key !== this.sceneKey;
     if (sceneChanged) {
@@ -649,13 +631,11 @@ export class Scene3D extends Component {
       void this.switchScene(key);
     }
     if (sceneChanged || snapshot.background !== this.background) void this.loadMap(snapshot.background, sceneChanged);
-
     const editable = this.canEdit();
     this.toolbar.setCanEdit(editable);
     if (!editable && this.tool !== 'orbit' && this.tool !== 'measure' && this.tool !== 'los') {
       this.setTool('orbit');
     }
-
     // Sync the active tool with Atlas's own, once per change so our own writes do not loop.
     if (snapshot.activeTool !== this.lastAtlasTool) {
       this.lastAtlasTool = snapshot.activeTool;
@@ -677,7 +657,6 @@ export class Scene3D extends Component {
         this.toolbar.setMeasureState(this.measure, this.measurePinCount);
       }
     }
-
     // The Look Atlas holds. The bar's Players toggle and width stepper read these; the tool reads
     // them when it creates a measure.
     this.measure = {
@@ -688,18 +667,14 @@ export class Scene3D extends Component {
       lineWidth: snapshot.measureLineWidth ?? this.measure.lineWidth,
     };
     this.toolbar.setMeasureState(this.measure, this.measurePinCount);
-
     this.toolbar.say(this.warning(snapshot), this.tool);
-
     const visibleTokens = snapshot.isPlayerView
       ? snapshot.tokens.filter((token) => token.isHidden !== true)
       : snapshot.tokens;
-
     this.tokensById = new Map(visibleTokens.map((token) => [token.id, token]));
     if (this.hoverId !== null && !this.tokensById.has(this.hoverId)) this.clearHover();
     this.defs = this.binding.resourceDefs() ?? inferDefs(visibleTokens);
     this.conditionDefs = new Map((this.binding.conditionDefs() ?? []).map((c) => [c.id, c]));
-
     const atlasSelection = snapshot.selectedIds.join('|');
     if (atlasSelection !== this.lastAtlasSelection) {
       this.lastAtlasSelection = atlasSelection;
@@ -712,10 +687,12 @@ export class Scene3D extends Component {
     if (this.selectedId !== null && !this.tokensById.has(this.selectedId)) {
       this.selectedId = [...this.selectedIds][0] ?? null;
     }
-
     this.applyGrid();
     this.applyTokens();
     this.syncMeasureContext();
+    // The accent ring around an origin badge follows whichever measurement ATLAS has open, not
+    // our own press: Atlas closes a stale popover on any store change, and we would never see it.
+    this.renderer.setOpenMeasurePopover(this.binding.measurePopoverId());
     this.interaction.refreshTactical();
     if (this.opts.embedded) this.scheduleSafeAreaSync();
   }
@@ -827,7 +804,6 @@ export class Scene3D extends Component {
   }
 
   // ---- camera & vertical cutaway --------------------------------------------------------------
-
   private centerCamera(): void {
     if (this.selectedId !== null && this.renderer.focusOnToken(this.selectedId)) return;
     this.renderer.focusOnCenter();
@@ -872,12 +848,10 @@ export class Scene3D extends Component {
   }
 
   // ---- editing & keyboard ---------------------------------------------------------------------
-
   private onKey(event: KeyboardEvent): void {
     if (isEditableTarget(event.target)) return;
     const key = event.key.toLowerCase();
     const command = event.ctrlKey || event.metaKey;
-
     if (event.key === 'Escape' && (this.tool === 'measure' || this.tool === 'los')) {
       event.preventDefault();
       event.stopPropagation();
@@ -918,7 +892,6 @@ export class Scene3D extends Component {
       }
     }
     if (command || event.altKey) return;
-
     if (key === '[' || key === ']') {
       event.preventDefault();
       event.stopPropagation();
@@ -1125,7 +1098,6 @@ export class Scene3D extends Component {
   }
 
   // ---- tokens: selection, menu, resources, statblock ----------------------------------------------
-
   private select(id: string | null): void {
     this.selectedIds = id === null ? new Set() : new Set([id]);
     this.selectedId = id;
@@ -1186,7 +1158,6 @@ export class Scene3D extends Component {
     const rules = this.rules();
     const ts = this.snapshot?.tokenSettings;
     const items: HudToken[] = [];
-
     for (const point of this.renderer.screenPoints()) {
       const token = this.tokensById.get(point.id);
       if (!token) continue;
@@ -1195,12 +1166,10 @@ export class Scene3D extends Component {
       const bars = selected
         ? shown.bars
         : shown.bars.filter((_, i) => (i === 0 ? ts?.showHpBars !== false : ts?.showSecondaryResourceBars !== false));
-
       const elev = token.elevation ?? 0;
       // Atlas writes the unit right after the number ("25ft"), a typed name after a space.
       const elevationText = elev > 0 ? `+${formatGameUnits(elev, rules)}` : formatGameUnits(0, rules);
       const meta = this.terrain.getTokenMeta(token.id);
-
       items.push({
         ...point,
         name: tokenName(token),

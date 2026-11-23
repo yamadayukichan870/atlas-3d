@@ -2,28 +2,35 @@
  * The one engine that turns Atlas VTT's measurements into 3D regions.
  *
  * Atlas is the source of truth. A kept measurement (`objects.measures`) — a ruler, an area, a
- * range, or a token aura — is read here and turned into a set of terrain cells plus the stepped
- * outline of exactly that set. The 3D view draws what this returns; it never invents geometry.
+ * range, or a token aura — is read here and turned into a set of terrain cells plus the outline
+ * the 3D view strokes. The view draws what this returns; it never invents geometry.
  *
- * The rule that fixes the fill/outline mismatch: the outline is DERIVED FROM THE FILLED CELLS
- * (`outlineOfCells`), never from the analytic polygon. A cell straddling the shape's edge is
- * painted whole, and the border runs around that whole cell — so fill and border are the same
- * figure by construction and cannot disagree. This is how Atlas draws an aura and how Foundry's
- * grid templates read: the region is a set of squares, its edge a staircase.
+ * THE OUTLINE IS THE AREA'S OWN RINGS, as Atlas strokes and fills `onMap.area.rings` whatever
+ * they are: the analytic circle / cone / box for a drawn measurement, and the stepped cell
+ * outline for an aura or a range, whose area IS grown cells. Deriving the outline from the
+ * covered cells turned every drawn circle into a square — a two-cell circle covers the 3x3 block
+ * almost whole under `half`, so its cell outline is a square. The cell tint the view paints on
+ * top is still stepped, which is exactly what Atlas' 2D shows: a smooth figure with a block of
+ * cells reading inside it.
  *
  * Two doors in, one shape out:
- *   - `regionFromKept`  : a measurement Atlas already holds (the 2D tools made it).
+ *   - `regionFromKept`  : a measurement Atlas already holds (its 2D tools made it).
  *   - `regionFromActive`: the measurement the 3D tool is drawing right now.
  * Both produce the same `MeasureRegion`, so a pinned measurement and the live preview render
  * identically, and keeping a measurement is just handing its points to Atlas.
  *
+ * A FOLLOWER needs no branch of its own. Atlas 0.18 added `anchor`: a measurement grouped with a
+ * token that keeps its shape and moves AND turns with it. Unlike an aura, its `points` ARE
+ * rewritten whenever the token moves (`measure/measureFollowers.ts`), so reading them as any
+ * drawn measurement is correct. Only `follows` + `aura` is an aura, whose points are a stale
+ * snapshot by design and whose geometry must come from the reach and the token's space.
+ *
  * World convention: x/z are the plan, y is up, one grid cell spans one world unit. Atlas stores
  * points in world pixels (y down); they are divided by the grid size to reach world units here.
- * Areas are plan figures projected onto every exposed terrain surface under the slice, so one
- * area can cover a floor and a balcony above it.
  *
  * Pure: no three.js, no DOM. Tested in Node.
  */
+
 import type { BlockMap } from './blocks';
 import type { Layout } from './layout';
 import {
@@ -67,23 +74,21 @@ export interface RegionRing {
 }
 
 /**
- * A measurement as the 3D view draws it: a set of cells, the stepped outline of exactly that
- * set, and the labels and tokens that go with it. Fill and outline come from the same cells.
+ * A measurement as the 3D view draws it: a set of cells, the outline Atlas strokes, and the
+ * labels and tokens that go with it.
  */
 export interface MeasureRegion {
   readonly id: string;
   readonly mode: AtlasMeasureMode;
-  /** The cells to fill, on every surface they cover under the slice. */
+  /** The cells to tint, on every surface they cover under the slice. */
   readonly cells: readonly AreaCell[];
-  /** The stepped outline of `cells` — the border, derived from the fill. */
+  /** The outline the border follows: the area's rings, or a grown cell set's staircase. */
   readonly outline: readonly PlanRing[];
   /** A ruler's path in world units; areas and ranges have none. */
   readonly path: readonly WorldPoint[] | null;
   readonly label: string;
   readonly subLabel?: string;
-  /** Per-leg labels of a multi-corner ruler. */
   readonly legs: readonly { readonly label: string; readonly at: WorldPoint }[];
-  /** Concentric boundaries of a range, inner to outer. */
   readonly rings: readonly RegionRing[];
   readonly tokenIds: readonly string[];
   /** '#rrggbb', or null for the theme's accent. */
@@ -110,6 +115,7 @@ export interface RegionContext {
 }
 
 const planOf = (p: WorldPoint): PlanPoint => ({ x: p[0], z: p[2] });
+const tenths = (value: number): string => `${Math.round(value * 10) / 10}`;
 
 function surfaceY(ctx: RegionContext, x: number, z: number): number {
   const ceiling = Number.isFinite(ctx.maxLayer) ? ctx.maxLayer * ctx.map.layerHeight : Infinity;
@@ -140,20 +146,10 @@ function farthestPoint(rings: readonly PlanRing[], from: PlanPoint): PlanPoint |
   for (const ring of rings) {
     for (const p of ring) {
       const dist = Math.hypot(p.x - from.x, p.z - from.z);
-      if (dist > bestDist) {
-        bestDist = dist;
-        best = p;
-      }
+      if (dist > bestDist) { bestDist = dist; best = p; }
     }
   }
   return best;
-}
-
-function emptyRegion(id: string, mode: AtlasMeasureMode, pinned: boolean, color: string | null): MeasureRegion {
-  return {
-    id, mode, cells: [], outline: [], path: null, label: '', legs: [], rings: [],
-    tokenIds: [], color, pinned, hidden: false,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -186,24 +182,34 @@ function shapeRegion(
     maxLayer: ctx.maxLayer,
     cellRule: ctx.rules.areaCellRule,
   });
-  const outline = outlineOfCells(cells, ctx.layout);
+  // A beam's area IS its cells: the spine forces every cell its middle line crosses, and `half`
+  // marks both rows when the origin snaps to a cell edge. Stroking the analytic rectangle over
+  // that set is what made the marked floor disagree with the figure. A circle, cone or square
+  // keeps its analytic ring, which is what Atlas strokes for a drawn area.
+  const outline: PlanRing[] = mode === 'line' ? outlineOfCells(cells, ctx.layout) : [...area.rings];
   const tokenIds = tokensInArea(area, ctx.tokens);
   const length = Math.hypot(end.x - origin.x, end.z - origin.z);
   const rise = worldPoints[worldPoints.length - 1]![1] - worldPoints[0]![1];
   const subLabel = Math.abs(rise) >= 0.08
     ? `ΔH ${rise >= 0 ? '+' : ''}${formatGameUnits(rise * ctx.rules.unitDistance, ctx.rules)}`
     : undefined;
-
+  // Atlas writes the unit ONCE for a square and a line: "1 × 1u", "2 × 1u" — the first number is
+  // the drag in cells, the second is the width or side with its unit. Writing it twice ("1u × 1u")
+  // is a label Atlas never produces.
   let label: string;
   if (mode === 'square') {
-    const side = formatDistance(length, ctx.rules);
-    label = `${side} × ${side}`;
+    label = `${tenths(length)} × ${formatDistance(length, ctx.rules)}`;
   } else if (mode === 'line') {
-    label = `${formatDistance(length, ctx.rules)} × ${formatDistance(widthCells, ctx.rules)}`;
+    label = `${tenths(length)} × ${formatDistance(widthCells, ctx.rules)}`;
   } else {
     label = formatDistance(length, ctx.rules);
   }
-  return { cells, outline, label, ...(subLabel !== undefined && { subLabel }), tokenIds, radiusCells: area.reach };
+  return {
+    cells, outline, label,
+    ...(subLabel !== undefined && { subLabel }),
+    tokenIds,
+    radiusCells: area.reach,
+  };
 }
 
 function rulerRegion(
@@ -245,7 +251,8 @@ function rulerRegion(
 
 /**
  * A kept measurement of Atlas, as a 3D region. An aura's geometry comes from its reach and the
- * token's own space — never from its stored points, which are a stale snapshot by design.
+ * token's own space — never from its stored points, which are a stale snapshot by design. A
+ * follower's points ARE rewritten by Atlas when its token moves, so it reads as any drawn area.
  */
 export function regionFromKept(measure: AtlasMeasure, ctx: RegionContext): MeasureRegion | null {
   if (!(ctx.gridSize > 0)) return null;
@@ -256,7 +263,8 @@ export function regionFromKept(measure: AtlasMeasure, ctx: RegionContext): Measu
     : DEFAULT_LINE_WIDTH_CELLS;
 
   // An aura: a circle that follows a token, grown from the cells it stands on.
-  if (typeof measure.follows === 'string' && typeof measure.aura === 'number' && measure.aura > 0) {
+  if (typeof measure.follows === 'string' && measure.follows !== ''
+    && typeof measure.aura === 'number' && measure.aura > 0) {
     const anchor = ctx.tokens.find((t) => t.id === measure.follows);
     if (!anchor) return null;
     const reach = measure.aura / (ctx.rules.unitDistance > 0 ? ctx.rules.unitDistance : 1);
@@ -284,7 +292,6 @@ export function regionFromKept(measure: AtlasMeasure, ctx: RegionContext): Measu
   const mode = measure.shape as AtlasMeasureMode;
   if (!ATLAS_MEASURE_SHAPES.includes(mode as AtlasMeasureShape)) return null;
   if (!Array.isArray(measure.points) || measure.points.length < 2) return null;
-
   const worldPoints: WorldPoint[] = measure.points.map((p) => {
     const x = p.x / ctx.gridSize;
     const z = p.y / ctx.gridSize;
@@ -307,6 +314,7 @@ export function regionFromKept(measure: AtlasMeasure, ctx: RegionContext): Measu
       color,
       pinned: true,
       hidden,
+      ...(typeof measure.follows === 'string' && measure.follows !== '' && { follows: measure.follows }),
     };
   }
 
@@ -326,6 +334,7 @@ export function regionFromKept(measure: AtlasMeasure, ctx: RegionContext): Measu
     color,
     pinned: true,
     hidden,
+    ...(typeof measure.follows === 'string' && measure.follows !== '' && { follows: measure.follows }),
   };
 }
 
@@ -393,6 +402,7 @@ export function regionFromActive(
     label: shaped.label,
     ...(shaped.subLabel !== undefined && { subLabel: shaped.subLabel }),
     legs: [], rings: [], tokenIds: shaped.tokenIds, color, pinned: false, hidden: false,
+    ...(anchorId != null && { follows: anchorId }),
   };
 }
 

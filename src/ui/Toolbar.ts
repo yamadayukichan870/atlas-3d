@@ -4,6 +4,29 @@ import type { MeasureState } from '../tools/ToolController';
 import type { AtlasMeasureMode } from '../atlas/measureRules';
 import type { CameraKind, Tool, ViewPreset } from '../view/SceneRenderer';
 
+/**
+ * The 3D map's own bar. TEMPORARY by design: the goal is Atlas' own buttons driving our tools
+ * (which already happens for Measure AND Move, through the store), plus Obsidian's own surfaces
+ * for the rest — `View.addAction` for view-level toggles, commands with hotkeys for the camera,
+ * and a `Menu` for the handful of switches. What stays here is what has no home upstream:
+ * the terrain tools and the vertical slice.
+ *
+ * THE CAMERA BELONGS TO THE VIEW, NOT TO A TOOL. Verified in both upstreams: Atlas installs its
+ * drag plugin ONCE on the viewport (`new MouseDrag(viewport, { mouseButtons: 'right' })`, "The
+ * right button pans, for a mouse alone"), and IsoCON puts rotate on the right drag and pan on
+ * the middle, swapped by its `PanWithRight` preference. Neither makes navigation a tool. So the
+ * RIGHT button PANS in every tool — the hand anyone arriving from the 2D map already has — and
+ * rotating, which a flat map has no gesture for, goes on the PRESSED WHEEL. Shift+right rotates,
+ * for a trackpad with no middle button. The left button always belongs to the active tool.
+ *
+ * THERE IS NO ORBIT BUTTON. `Move` is the merged select-and-move tool — Atlas' own id — and the
+ * neutral one: click selects, drag moves, a clean click on empty ground deselects. The hints
+ * below say so; they used to describe the old per-tool mapping and a separate Orbit tool.
+ *
+ * The measure bar speaks Atlas' six modes, where `ruler` (a path with corners) and `line` (a
+ * rectangle L×W) are DIFFERENT things. The legacy four-name bar is kept only as a fallback for a
+ * scene that has not wired `onMeasureMode`. Controls whose handler is absent are not drawn.
+ */
 export interface ToolbarHandlers {
   onTool(tool: Tool): void;
   onBrush(size: number): void;
@@ -33,14 +56,51 @@ export interface ToolbarHandlers {
   onMeasureLineWidth?(cells: number): void;
 }
 
+/**
+ * The camera clause every tool's hint shares, so the mapping is stated once and cannot drift
+ * between tools: right pans, the pressed wheel rotates, Shift+right rotates without a middle
+ * button, the wheel zooms and the arrows pan.
+ */
+const CAMERA_HINT = 'Right drag pans (as on the 2D map), press the wheel and drag to rotate '
+  + '(Shift+right also rotates), wheel zooms, Arrows pan.';
+
 const TOOLS: ReadonlyArray<{ tool: Tool; label: string; hint: string }> = [
-  { tool: 'orbit', label: 'Orbit', hint: 'Left drag rotates, right drag pans, wheel zooms, Arrows pan, [ / ] or Alt+Q/E turn 90°, Home/Alt+H or double click centers. Click a token to select, right click for menu, Ctrl+hover for statblock.' },
-  { tool: 'raise', label: 'Raise', hint: 'Paint columns up by one layer. Right drag rotates, Arrows pan.' },
-  { tool: 'lower', label: 'Lower', hint: 'Paint columns down by one layer. Right drag rotates, Arrows pan.' },
-  { tool: 'build', label: 'Build', hint: 'Click to add, rotate or remove single blocks. Hold Alt to remove, Alt+R to turn the piece (Alt+Shift+R the other way). Right drag rotates.' },
-  { tool: 'move', label: 'Move', hint: 'Drag a token; it snaps to the grid and is written back to Atlas. Double click centers camera.' },
-  { tool: 'measure', label: 'Measure', hint: '3D Ruler & AoE: drag or click-click to measure. Shift+Click adds a waypoint, Alt disables snap, Shift on release reverses Keep, Esc/right-click cancels.' },
-  { tool: 'los', label: 'LoS', hint: '3D Line of Sight: click origin token or cell, sweep to target (green = clear, yellow = partial cover, red = blocked). Click to lock, Esc/right-click resets.' },
+  {
+    tool: 'move',
+    label: 'Move',
+    hint: 'Click a token to select, drag it to move (snapped to the grid, written back to Atlas), '
+      + 'click empty ground to deselect, right click a token for its menu, Ctrl+hover for its '
+      + 'statblock, double click centers. ' + CAMERA_HINT
+      + ' [ / ] or Alt+Q/E turn 90°, Home/Alt+H centers.',
+  },
+  {
+    tool: 'raise',
+    label: 'Raise',
+    hint: 'Paint columns up by one layer. ' + CAMERA_HINT,
+  },
+  {
+    tool: 'lower',
+    label: 'Lower',
+    hint: 'Paint columns down by one layer. ' + CAMERA_HINT,
+  },
+  {
+    tool: 'build',
+    label: 'Build',
+    hint: 'Click to add, rotate or remove single blocks. Hold Alt to remove, Alt+R to turn the '
+      + 'piece (Alt+Shift+R the other way). ' + CAMERA_HINT,
+  },
+  {
+    tool: 'measure',
+    label: 'Measure',
+    hint: '3D Ruler & AoE: drag or click-click to measure. Shift+Click adds a waypoint, Alt '
+      + 'disables snap, Shift on release reverses Keep, Esc/right-click cancels. ' + CAMERA_HINT,
+  },
+  {
+    tool: 'los',
+    label: 'LoS',
+    hint: '3D Line of Sight: click origin token or cell, sweep to target (green = clear, '
+      + 'yellow = partial cover, red = blocked). Click to lock, Esc/right-click resets. ' + CAMERA_HINT,
+  },
 ];
 
 /** The legacy four-name bar, shown until the scene wires onMeasureMode. */
@@ -184,7 +244,7 @@ export class Toolbar {
     this.measureClearButton = button(this.measureBar, 'Clear', 'Remove every kept measurement of the level shown (Atlas\'s own Clear)', () => handlers.onMeasureClear());
 
     this.status = root.createDiv({ cls: 'atlas3d-status' });
-    this.setTool('orbit');
+    this.setTool('move');
     this.setBrush(1);
     this.setSlice(null, 0);
     this.setMeasureState({ shape: 'line', keep: false }, 0);
@@ -223,7 +283,9 @@ export class Toolbar {
 
   setCanEdit(canEdit: boolean): void {
     this.canEdit = canEdit;
-    for (const tool of ['raise', 'lower', 'build', 'move'] as const) {
+    // Move is the neutral tool and stays reachable even without an editable grid — selecting
+    // and looking are always allowed; the drag itself is gated by canMove() at gesture time.
+    for (const tool of ['raise', 'lower', 'build'] as const) {
       const btn = this.toolButtons.get(tool);
       if (btn) btn.disabled = !canEdit;
     }

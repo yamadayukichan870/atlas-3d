@@ -3,7 +3,7 @@ import type { BlockMap } from '../terrain/blocks';
 import type { Layout } from '../terrain/layout';
 import type { AoEShape } from '../terrain/raycast';
 import { quarterOf, surfaceFraction, type Vec3 } from '../terrain/shapes';
-import type { AreaCell, AreaTokenTarget, PlanPoint, PlanRing } from '../terrain/measureGeometry';
+import type { AreaCell, AreaTokenTarget, PlanRing } from '../terrain/measureGeometry';
 import {
   regionFromActive, regionFromKept,
   type MeasureRegion, type RegionContext, type WorldPoint,
@@ -28,45 +28,80 @@ import {
 /**
  * Draws what the measurement engine returns, and nothing it does not.
  *
+ * THE COLOUR IS THE MEASUREMENT'S, AND NULL MEANS THE THEME'S ACCENT — WITH AN EFFECT TOO.
+ * `MEASURE_EFFECT_STARTS` says whether a look gives LIGHT or DARKNESS; its `color` is what Atlas'
+ * picker writes when the effect is chosen, not what the renderer imposes. Substituting it for a
+ * null colour made every effect burn orange while the 2D, on "Predeterminado", burned in the
+ * theme's accent. A null colour now reaches `resolveMeasureColor`, which reads Obsidian's accent.
+ *
  * THE BODY IS ATLAS' AreaBody.draw(), layer for layer: wash 0.12 edge-to-edge, cell tint 0.16
- * inset max(1px, cell×0.025), outline 0.9 at max(2px, cell/28). With an effect the effect mesh
- * REPLACES the wash and lies UNDER the tint and the outline, which still draw on top.
+ * inset max(1px, cell×0.025), outline at max(2px, cell/28). With an effect the effect mesh REPLACES
+ * the wash and lies UNDER the tint and the outline, which still draw on top. The layers are held
+ * well apart: they were 0.003 apart, which at the distance a camera preset chooses is less than
+ * one depth step, so the wash and the tint fought for the depth test in patches that moved.
  *
- * ONE STROKE, ONE COLOUR, ONE PASS. There is no dark casing under anything, and the outline is
- * drawn ONCE for the whole ring — not once per height group. A piece with no covered cell under
- * it used to be skipped by no pass at all and so drawn by every one of them, blending twice.
+ * EVERY STROKE IS ONE MITRED BAND, OPAQUE, DRAWN ONCE. The outline used to be walked in short
+ * pieces, each prolonged half a width past its ends so two edges meeting at a corner would overlap
+ * instead of leaving a notch. On a circle every edge is shorter than the walk step, so EVERY piece
+ * was prolonged at both ends and overlapped both neighbours; being translucent, the overlap blended
+ * twice and the ring read as a chain of darker beads. At a cone's apex the prolongations crossed
+ * outside the figure and drew spikes.
  *
- * THE OUTLINE IS A CLOSED BAND OF CONSTANT WIDTH, mitred at each vertex. It used to be walked in
- * short pieces whose first and last were prolonged half a width so two edges meeting at a corner
- * would overlap instead of leaving a notch. On a circle every edge is shorter than the walk step,
- * so EVERY piece was prolonged at both ends and overlapped both neighbours; being transparent,
- * the overlap blended twice and the ring read as a chain of darker beads. At a cone's corners the
- * prolongations did not fill the outer wedge either, leaving a notch. A mitred band has neither
- * problem: consecutive pieces share exact vertices, so they tile without overlap or gap, and the
- * mitre closes the corner. Each piece takes the height of its OWNER (the nearest covered cell),
- * never a fresh sample of the column below, which used to stretch a ribbon from floor to roof.
+ * Here each ring is offset to either side with a MITRE at every vertex, one quad per edge, plus a
+ * round disc at each vertex for the join. Consecutive quads share exact vertices, so they tile
+ * without gap; and the material is OPAQUE, as Atlas' own accent is, so even where a join disc
+ * overlaps the band nothing blends twice. Heights are taken per VERTEX from the nearest covered
+ * cell, so a band across a step tilts with the terrain instead of tearing, and it is built ONCE for
+ * the whole ring — per height group, a piece with no owner was skipped by none of them and drawn
+ * by all of them.
  *
- * THE STROKE'S WIDTH IS ATLAS' OWN: max(2px, grid.size/28) in world pixels, which in cells is
- * max(2/grid.size, 1/28). A fixed 0.04 assumed fifty pixels to a cell; on a map whose cells are
- * larger that drew the outline thicker than Atlas does.
+ * THE RULER IS DRAWN IN SCREEN PIXELS, at the border's own width turned into pixels once per frame,
+ * so it reads as thick as the areas' outlines and the same at both ends. It writes its OWN projected
+ * depth, so terrain occludes it exactly as it occludes an area: a ruler that ignored the depth test
+ * slid over walls as the camera turned and read as detached from the floor. An END of its path has
+ * one segment and takes that segment's normal at the full half width: the mitre formula there
+ * divides by a zero cosine, clamps to the floor, and made the last point four times wider.
  *
- * THE RULER IS DRAWN IN SCREEN PIXELS, so its width does not change with distance. An END of its
- * path has only one segment and takes that segment's normal at the full half width: running the
- * mitre formula there divides by a zero cosine, clamps to the floor, and made the last point four
- * times wider than the first — the taper. Round caps stand in for its nodes.
+ * THE HANDLES SIT ON THE MEASUREMENT'S OWN POINTS. The origin badge shares the ink's first vertex
+ * (`measureHandlePoint`), at that point's own height, lifted exactly as the ink is — it used to take
+ * the highest surface the region covers, a different point from where the line starts, and the two
+ * drifted apart with the camera's angle and zoom. The far dot stands at the second point
+ * (`measureEndHandlePoint`), not at a vertex of the outline: a 32-sided circle has a vertex every
+ * 11.25°, so picking one made the handle jump around the rim instead of following the pointer. An
+ * aura's badge still rides its token's rim, turned by the view's azimuth so it stays lower-left.
  *
- * THE HANDLES ARE ATLAS' OWN: origin badge r10 glyph12 hit12 carrying the measurement's SHAPE;
- * far dot r6 hit9; turn dot r6 hit9 standing 16 screen pixels to the right of the far dot as seen
- * from the origin, and only for a cone, square or line, carrying a turn glyph. Plate in the theme's
- * badge colour, ring in the measurement's colour made readable ON THAT PLATE by WCAG contrast 3.
+ * THE HANDLES ARE ATLAS' OWN, drawn as MeasureHandles.draw() draws them: hairline at R+0.5, plate
+ * at R in the theme's badge colour at 0.95, ring stroke 1.5px centred at R−1.25 in the measure's
+ * colour at 0.9, accent ring 2px at R+3 while its popover is open. The turn dot's ring is 1px at
+ * R−0.75 and two arrows chase each other round it (measureTurnHandle.ts). Hover ×1.12, drag ×1.2.
  *
- * A DRAG SURVIVES A REBUILD and carries its own geometry. THE BADGE FOLLOWS THE CAMERA.
+ * A TOKEN'S POSITION IS NOT IN THE CONTEXT KEY. It was, and that made dropping one token rebuild
+ * every measurement on the map: the key changed, so every signature changed, so `apply` disposed
+ * and rebuilt every entry — geometry, materials and the DOM pills and handles, which is what read
+ * as a blink. Where a position genuinely matters it is already in the per-region signature: an
+ * aura's cells and anchors move with its bearer, a drawn area's `tokenIds` change when a token
+ * enters or leaves it, and a badge that sits on a token carries that anchor.
+ *
+ * EVERY LABEL AND HANDLE IS BORN HIDDEN. A new element has no left/top until `updateScreenLabels`
+ * places it, so visible before that it paints one frame at the layer's static origin — the corner.
+ * `place` reveals it the moment it is projected, which is the same frame or the next.
+ *
+ * RISERS BELONG TO A STEPPED OUTLINE — an aura or a range ring, whose area IS grown cells. A beam is
+ * a drawn rectangle, not a grown region, so it is not among them.
+ *
+ * NO 3D SHELLS. The volume of a figure is to become a per-measurement choice in its options, not
+ * something every area wears: an extruded box over a beam read as a slab standing on the map, and an
+ * aura's cylinder was a disc larger than its stepped footprint whose bottom cap fought the floor.
+ * `terrain/measureVolume.ts` still supplies the origin, reach and direction the effect fill needs;
+ * `view/measureShells.ts` is kept for when that toggle lands, with no caller today.
+ *
+ * A DRAG SURVIVES A REBUILD and carries its own geometry. The far dot emits reach AND direction; the
+ * turn dot emits direction alone, keeping the reach.
  *
  * Render ladder: terrain 0, water 1, grid 2, numbers 3, token art 3-5.
  * Glow 2.2, effect 2.4, wash 2.4, cells 2.5, riser 2.55, border 2.6,
- * ruler drop 13, ruler stroke 14, LoS 14-16.
+ * ruler drop 13, ruler stroke 14, ruler nodes 15, LoS 14-16.
  */
-
 export interface MeasureLeg { readonly label: string; readonly at: Vec3 }
 
 export interface MeasureDisplay {
@@ -119,6 +154,7 @@ export interface MeasureResize {
   readonly id: string;
   readonly cells: number;
   readonly free: boolean;
+  /** Where the pointer lies from the anchor, one unit long: the handle is MOVED, not just sized. */
   readonly direction?: { x: number; z: number };
 }
 
@@ -146,21 +182,28 @@ interface DragState {
 
 interface GlowState { mat: THREE.MeshBasicMaterial; blocked: boolean; flick: boolean }
 
-/** A ruler's stroke, held in NDC and refilled from the projected path every frame. */
-interface RulerStroke {
-  readonly path: readonly WorldPoint[];
+/** One screen-space drawable: its NDC buffer is refilled from world points every frame. */
+interface InkPart {
   readonly mesh: THREE.Mesh;
   readonly attr: THREE.BufferAttribute;
-  readonly halfPx: number;
-  readonly capPx: number;
+  readonly mat: THREE.ShaderMaterial;
+}
+
+/** A ruler's ink: the ribbon, the point dots, and the white middle of the origin's hollow one. */
+interface RulerInk {
+  readonly path: readonly WorldPoint[];
+  /** The stroke's width in world units, turned into pixels each frame at the current zoom. */
+  readonly widthWorld: number;
+  readonly ribbon: InkPart;
+  readonly nodes: InkPart;
+  readonly hollow: InkPart | null;
 }
 
 interface Entry {
   id: string; group: THREE.Group;
   pills: PillEntry[]; handles: HandleEntry[];
-  strokes: RulerStroke[];
   geoms: THREE.BufferGeometry[]; mats: THREE.Material[]; insts: THREE.InstancedMesh[];
-  fx: EffectFill | null; glow: GlowState | null;
+  fx: EffectFill | null; glow: GlowState | null; ruler: RulerInk | null;
   signature: string; fadeStart: number | null;
   baseOpacity: Map<THREE.Material, number>;
 }
@@ -173,6 +216,8 @@ interface BorderEdge {
 interface Anchors {
   readonly top: { x: number; z: number } | null;
   readonly config: { x: number; z: number } | null;
+  /** The height of the measurement's own first point; null when the badge rides a token's rim. */
+  readonly configY: number | null;
   readonly end: { x: number; z: number } | null;
   readonly centre: { x: number; z: number };
   readonly direction: { x: number; z: number };
@@ -182,17 +227,15 @@ interface Anchors {
   readonly resizable: boolean; readonly turnable: boolean;
 }
 
-// ---- the body, exactly as Atlas' BODY constant holds it ---------------------------------------
+// ---- the body, as Atlas' BODY constant holds it ------------------------------------------------
 const WASH_OPACITY = 0.12;
 const CELL_OPACITY = 0.16;
-const BORDER_OPACITY = 0.9;
+/** The accent stroke is OPAQUE, as Atlas' own is: overlaps then never blend twice. */
+const STROKE_OPACITY = 1;
 const CELL_INSET = 0.025;
 const MIN_CELL_INSET = 0.02;
-/** Atlas' outline width as a share of a cell, and its floor in world pixels. */
 const BORDER_WIDTH_SHARE = 1 / 28;
-const BORDER_MIN_PX = 2;
-/** Where no grid size is known: Atlas' usual fifty pixels to a cell. */
-const FALLBACK_GRID_PX = 50;
+const MIN_BORDER_WIDTH = 0.04;
 const WASH_ORDER = 2.4;
 const FILL_ORDER = 2.5;
 const RISER_ORDER = 2.55;
@@ -200,28 +243,41 @@ const BORDER_ORDER = 2.6;
 const GLOW_ORDER = 2.2;
 const DROP_ORDER = 13;
 const PATH_ORDER = 14;
-const FILL_LIFT = 0.021;
+const NODE_ORDER = 15;
+/**
+ * The layers are held well apart. They were 0.003 apart, which at the distance a camera preset
+ * chooses is less than one depth step of a wide clipping range — so the wash and the cell tint
+ * fought for the depth test in patches that moved with the camera.
+ */
 const WASH_LIFT = 0.018;
-const BORDER_LIFT = 0.028;
-const PATH_LIFT = 0.04;
+const FILL_LIFT = 0.034;
+const BORDER_LIFT = 0.052;
+const PATH_LIFT = 0.07;
 const RISER_INSET = 0.35;
 const RISER_EPSILON = 0.02;
 const RISER_OPACITY = 0.42;
 const FADE_MS = 2000;
-/** How finely a band is walked so a height step is met where it happens. */
-const BORDER_STEP = 0.25;
 const OWNER_REACH = 2;
 const GLOW_SPREAD = 2.4;
 const GLOW_OPACITY = 0.55;
-/** The least a mitre's cosine may be, so a sharp spike does not throw a vertex away. */
 const MITRE_COS_FLOOR = 0.25;
+/** Triangles in one round join or node disc. */
+const DISC_SEGMENTS = 16;
 
 // ---- the ruler, in screen pixels ---------------------------------------------------------------
-const RULER_HALF_PX = 1;
-const RULER_CAP_PX = 3.5;
-const CAP_SEGMENTS = 12;
+const INK_DOT_PX = 4;
+const MIN_STROKE_PX = 2;
+const HOLLOW_MIDDLE = '#ffffff';
+const FALLBACK_PX_PER_UNIT = 40;
+const SCREEN_VERTEX = `
+void main(){ gl_Position = vec4(position.xy, position.z, 1.0); }`;
+const SCREEN_FRAGMENT = `
+precision mediump float;
+uniform vec3 uColor;
+uniform float uOpacity;
+void main(){ gl_FragColor = vec4(uColor, uOpacity); }`;
 
-// ---- the handles, exactly as Atlas' measureHandle.ts holds them -------------------------------
+// ---- the handles, as Atlas' measureHandle.ts holds them ----------------------------------------
 const HANDLE_RADIUS = 10;
 const HANDLE_GLYPH = 12;
 const HANDLE_HIT = 12;
@@ -229,7 +285,13 @@ const END_RADIUS = 6;
 const END_HIT = 9;
 const TURN_RADIUS = 6;
 const TURN_HIT = 9;
-const TURN_GLYPH = 8;
+/** Every handle's size, as a multiple of Atlas' own. 1 is parity; raise it if they read small. */
+const HANDLE_SCALE = 1;
+const RING_INSET = 1.25;
+const RING_WIDTH = 1.5;
+const TURN_RING_INSET = 0.75;
+const TURN_RING_WIDTH = 1;
+const RING_ALPHA = 0.9;
 const TURN_OFFSET = END_RADIUS + TURN_RADIUS + 4;
 const HOVER_LIFT = 1.12;
 const DRAG_LIFT = 1.2;
@@ -240,6 +302,11 @@ const OUTLINE_UP = { x: 0, z: -1 };
 const LEAST_FREE_REACH = 0.5;
 const RIM_ROOM = 0.01;
 const EFFECT_FPS = 30;
+/** measureTurnHandle.ts: two arrows chasing each other round the dot, in the badge's ink. */
+const TURN_ARC_RADIUS = 2.5;
+const TURN_ARC_WIDTH = 1;
+const TURN_HEAD = 1.5;
+const TURN_ARCS: readonly (readonly [number, number])[] = [[-2.97, -0.5], [0.17, 2.64]];
 
 /** Lucide's own paths, exactly as Atlas' SHAPE_GLYPHS holds them. */
 const SHAPE_GLYPH: Readonly<Record<string, readonly string[]>> = {
@@ -254,26 +321,11 @@ const SHAPE_GLYPH: Readonly<Record<string, readonly string[]>> = {
   ranges: ['M12 12m-3 0a3 3 0 1 0 6 0a3 3 0 1 0-6 0', 'M12 12m-8 0a8 8 0 1 0 16 0a8 8 0 1 0-16 0'],
 };
 
-/** The turn dot's glyph: Lucide's rotate-cw, sized to fit a radius-6 dot. */
-const TURN_GLYPH_PATHS: readonly string[] = [
-  'M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8',
-  'M21 3v5h-5',
-];
-
 const FALLBACK_RULES: AtlasMeasurementSettings = {
   mode: 'metric', unitType: 'feet', unitDistance: 5, ruleDistance: 5,
   diagonalRule: DEFAULT_DIAGONAL_RULE, difficultTerrain: 'none', rangeBands: [],
   coneAngle: DEFAULT_CONE_ANGLE, areaCellRule: DEFAULT_AREA_CELL_RULE, coneEnd: DEFAULT_CONE_END,
 };
-
-// ---- a stroke held in NDC, so its width is pixels and nothing else -----------------------------
-const SCREEN_VERTEX = `
-void main(){ gl_Position = vec4(position.xy, 0.0, 1.0); }`;
-const SCREEN_FRAGMENT = `
-precision mediump float;
-uniform vec3 uColor;
-uniform float uOpacity;
-void main(){ gl_FragColor = vec4(uColor, uOpacity); }`;
 
 let glowTex: THREE.Texture | null = null;
 function radialGlow(): THREE.Texture {
@@ -313,6 +365,18 @@ function createCircleRingGeometry(): THREE.BufferGeometry {
   return g;
 }
 
+/** The sRGB bytes a raw screen shader writes: it has no colourspace chunk of its own. */
+function srgbVector(hex: string): THREE.Vector3 {
+  const n = Number.parseInt(hex.replace('#', ''), 16);
+  if (!Number.isFinite(n)) return new THREE.Vector3(1, 1, 1);
+  return new THREE.Vector3(((n >> 16) & 0xff) / 255, ((n >> 8) & 0xff) / 255, (n & 0xff) / 255);
+}
+
+/**
+ * The mode a display is. Every current producer sets `mode` and it wins. The fallbacks read an
+ * Atlas name through Atlas' door and a legacy toolbar name through the legacy one: one map serving
+ * both read Atlas' `line` — a rectangle — as `ruler`, which stripped a kept line of its body.
+ */
 const modeOf = (d: MeasureDisplay): AtlasMeasureMode =>
   d.mode ?? atlasModeOf(d.shape) ?? (isLegacyShape(d.shape) ? atlasModeOfLegacy(d.shape) : 'ruler');
 
@@ -324,48 +388,13 @@ const plateHex = (n: number): string => `#${(n >>> 0).toString(16).padStart(6, '
 const plateRgba = (n: number, alpha: number): string =>
   `rgba(${(n >> 16) & 0xff},${(n >> 8) & 0xff},${n & 0xff},${alpha})`;
 
+/** The stroke width every figure wears, in world units: the area border's own. */
+const strokeWidth = (): number => Math.max(MIN_BORDER_WIDTH, BORDER_WIDTH_SHARE);
+
 /** The unit left normal of a plan direction; zero for a direction that is none. */
 function leftOf(dx: number, dz: number): { x: number; z: number } {
   const len = Math.hypot(dx, dz);
   return len > 1e-9 ? { x: -dz / len, z: dx / len } : { x: 0, z: 0 };
-}
-
-const lerpP = (a: PlanPoint, b: PlanPoint, t: number): PlanPoint =>
-  ({ x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t });
-
-/**
- * A closed ring's two offset chains, mitred at every vertex, `half` to either side.
- *
- * This is what replaces prolonging each walked piece past its ends. Consecutive pieces of the
- * band share exact vertices, so they tile without overlap and without gap: a transparent stroke
- * never blends twice, and the mitre closes each corner instead of leaving a notch. The cosine is
- * floored so a very sharp spike offsets by at most four half-widths rather than flying away.
- */
-function ringBand(ring: PlanRing, half: number): { outer: PlanPoint[]; inner: PlanPoint[] } {
-  const n = ring.length;
-  const outer: PlanPoint[] = [];
-  const inner: PlanPoint[] = [];
-  for (let i = 0; i < n; i++) {
-    const prev = ring[(i - 1 + n) % n]!;
-    const v = ring[i]!;
-    const next = ring[(i + 1) % n]!;
-    const n1 = leftOf(v.x - prev.x, v.z - prev.z);
-    const n2 = leftOf(next.x - v.x, next.z - v.z);
-    let mx = n1.x + n2.x, mz = n1.z + n2.z;
-    const ml = Math.hypot(mx, mz);
-    if (ml > 1e-9) { mx /= ml; mz /= ml; } else { mx = n2.x; mz = n2.z; }
-    const cos = Math.max(MITRE_COS_FLOOR, mx * n2.x + mz * n2.z);
-    const s = half / cos;
-    outer.push({ x: v.x + mx * s, z: v.z + mz * s });
-    inner.push({ x: v.x - mx * s, z: v.z - mz * s });
-  }
-  return { outer, inner };
-}
-
-/** Atlas' outline width in cells: max(2px, grid.size/28) world pixels, over the cell's own size. */
-function borderWidthOf(gridSize: number | undefined): number {
-  const size = typeof gridSize === 'number' && gridSize > 1 ? gridSize : FALLBACK_GRID_PX;
-  return Math.max(BORDER_MIN_PX / size, BORDER_WIDTH_SHARE);
 }
 
 function fittedReach(cells: number, free: boolean): number {
@@ -407,8 +436,8 @@ function outlinePointAt(
   let best: { x: number; z: number } | null = null;
   let bestDot = -Infinity;
   for (const ring of rings) for (const p of ring) {
-    const dot = (p.x - centre.x) * dir.x + (p.z - centre.z) * dir.z;
-    if (dot > bestDot) { bestDot = dot; best = { x: p.x, z: p.z }; }
+    const d = (p.x - centre.x) * dir.x + (p.z - centre.z) * dir.z;
+    if (d > bestDot) { bestDot = d; best = { x: p.x, z: p.z }; }
   }
   return best;
 }
@@ -431,6 +460,35 @@ function rawColorOf(d: MeasureDisplay): string | null {
   return null;
 }
 
+/** The turn dot's glyph, built from Atlas' own arcs and heads rather than a looked-out icon. */
+function turnGlyphSvg(diameter: number, ink: string): string {
+  const c = TURN_RADIUS;
+  const f = (n: number): string => n.toFixed(2);
+  const parts: string[] = [];
+  for (const [from, to] of TURN_ARCS) {
+    const x0 = c + TURN_ARC_RADIUS * Math.cos(from);
+    const y0 = c + TURN_ARC_RADIUS * Math.sin(from);
+    const x1 = c + TURN_ARC_RADIUS * Math.cos(to);
+    const y1 = c + TURN_ARC_RADIUS * Math.sin(to);
+    const large = to - from > Math.PI ? 1 : 0;
+    // Screen y grows downward, so a rising angle is clockwise: SVG's sweep flag 1.
+    parts.push(
+      `<path d="M${f(x0)} ${f(y0)}A${TURN_ARC_RADIUS} ${TURN_ARC_RADIUS} 0 ${large} 1 ${f(x1)} ${f(y1)}"`
+      + ` fill="none" stroke="${ink}" stroke-width="${TURN_ARC_WIDTH}"/>`,
+    );
+    const cos = Math.cos(to), sin = Math.sin(to);
+    const head = [
+      [x1 - sin * TURN_HEAD, y1 + cos * TURN_HEAD],
+      [x1 + cos * TURN_HEAD * 0.7, y1 + sin * TURN_HEAD * 0.7],
+      [x1 - cos * TURN_HEAD * 0.7, y1 - sin * TURN_HEAD * 0.7],
+    ];
+    parts.push(`<path d="M${head.map((p) => `${f(p[0]!)} ${f(p[1]!)}`).join('L')}Z" fill="${ink}"/>`);
+  }
+  const box = 2 * TURN_RADIUS;
+  return `<svg width="${diameter}" height="${diameter}" viewBox="0 0 ${box} ${box}"`
+    + ` xmlns="http://www.w3.org/2000/svg">${parts.join('')}</svg>`;
+}
+
 function regionSignature(region: MeasureRegion, ctxKey: string): string {
   return JSON.stringify([
     ctxKey, region.mode, region.label, region.subLabel ?? null, region.color,
@@ -443,6 +501,17 @@ function regionSignature(region: MeasureRegion, ctxKey: string): string {
   ]);
 }
 
+/**
+ * What EVERY region's drawing depends on, keyed once per pass.
+ *
+ * TOKEN POSITIONS ARE NOT HERE. They were, and that made dropping one token rebuild every
+ * measurement on the map: the key changed, so every signature changed, so `apply` disposed and
+ * rebuilt every entry — geometry, materials and the DOM pills and handles, which is what read as
+ * a blink. Where a position genuinely matters it is already in the per-region signature: an
+ * aura's cells and anchors move with its bearer, a drawn area's `tokenIds` change when a token
+ * enters or leaves it, and a badge that sits on a token carries that anchor. The token SET and
+ * their sizes stay, which is what a rim offset and a footprint depend on.
+ */
 function contextKey(ctx: TacticalOverlayContext): string {
   const r = ctx.rules;
   return JSON.stringify([
@@ -450,7 +519,7 @@ function contextKey(ctx: TacticalOverlayContext): string {
     r ? [r.diagonalRule, r.areaCellRule, r.coneAngle, r.coneEnd, r.unitDistance, r.mode, r.rangeBands] : null,
     ctx.movement?.steps.map((s) => [s.name, s.multiple, s.color]) ?? null,
     ctx.speed ?? null,
-    ctx.tokens?.map((t) => [t.id, t.x, t.z, t.diameter]) ?? null,
+    ctx.tokens?.map((t) => [t.id, t.diameter]) ?? null,
     ctx.selectedIds ?? null,
   ]);
 }
@@ -482,6 +551,7 @@ export class TacticalOverlays {
   private readonly scratch = new THREE.Vector3();
   private readonly pa = new THREE.Vector3();
   private readonly pb = new THREE.Vector3();
+  private readonly pc = new THREE.Vector3();
   private drag: DragState | null = null;
   private dragAbort: AbortController | null = null;
   private readonly life = new AbortController();
@@ -549,7 +619,6 @@ export class TacticalOverlays {
   updateScreenLabels(camera: THREE.Camera, width: number, height: number, azimuthDeg = 0): void {
     this.camera = camera;
     this.azimuth = (azimuthDeg * Math.PI) / 180;
-
     const due = this.clock.tick(performance.now(), this.still ? 0 : EFFECT_FPS);
     if (this.still) {
       for (const e of this.entries.values()) e.fx?.setStill(true);
@@ -560,7 +629,6 @@ export class TacticalOverlays {
         if (e.glow) e.glow.mat.opacity = e.glow.blocked ? 0 : GLOW_OPACITY * (0.84 + 0.16 * flickerVal(e.glow.flick, t));
       }
     }
-
     if (width <= 0 || height <= 0) return;
     const projected = new THREE.Vector3();
     const now = performance.now();
@@ -572,17 +640,12 @@ export class TacticalOverlays {
       el.style.top = `${(-projected.y * 0.5 + 0.5) * height}px`;
     };
     for (const entry of this.entries.values()) {
-      for (const stroke of entry.strokes) this.fillRulerStroke(stroke, camera, width, height);
       if (entry.fadeStart !== null) {
         const factor = 1 - Math.min(1, Math.max(0, (now - entry.fadeStart) / FADE_MS));
         for (const [mat, base] of entry.baseOpacity) {
           (mat as THREE.Material & { opacity: number }).opacity = base * factor;
         }
-        for (const s of entry.strokes) {
-          const m = s.mesh.material as THREE.ShaderMaterial;
-          const base = entry.baseOpacity.get(m);
-          if (base !== undefined) m.uniforms.uOpacity!.value = base * factor;
-        }
+        this.fadeRuler(entry, factor);
         (entry.fx as FadeableFill | null)?.setFade?.(factor);
         entry.group.visible = factor > 0;
         if (factor <= 0) {
@@ -591,6 +654,9 @@ export class TacticalOverlays {
           continue;
         }
       }
+      // The ruler's ink is rebuilt in pixels every frame: that is what keeps its width the same at
+      // both ends, and as thick as the areas' borders, at any zoom or bearing.
+      if (entry.ruler) this.fillRuler(entry.ruler, camera, width, height);
       for (const p of entry.pills) place(p.el, p.worldPos);
       for (const h of entry.handles) { this.turnBadge(h); place(h.el, h.worldPos); }
       this.placeTurnDot(entry, camera, width, height);
@@ -598,6 +664,7 @@ export class TacticalOverlays {
     if (this.losPill) place(this.losPill.el, this.losPill.worldPos);
   }
 
+  /** The origin badge rides its token's rim turned by the view, so it stays lower-left on screen. */
   private turnBadge(h: HandleEntry): void {
     if (h.part !== 'origin' || !h.bearer || !h.rim) return;
     const cos = Math.cos(this.azimuth), sin = Math.sin(this.azimuth);
@@ -605,6 +672,11 @@ export class TacticalOverlays {
     h.worldPos.z = h.bearer.z + h.rim.x * sin + h.rim.z * cos;
   }
 
+  /**
+   * The turn dot stands a fixed distance ON SCREEN to the right of the far dot, as seen from the
+   * origin — Atlas' own placement. Screen space is the only space where "16 pixels" means anything
+   * under an orbiting perspective camera.
+   */
   private placeTurnDot(entry: Entry, camera: THREE.Camera, width: number, height: number): void {
     const end = entry.handles.find((h) => h.part === 'end');
     const turn = entry.handles.find((h) => h.part === 'turn');
@@ -622,6 +694,7 @@ export class TacticalOverlays {
     const len = Math.hypot(dx, dy);
     if (!(len > 1e-3)) { turn.el.addClass('is-hidden'); return; }
     turn.el.removeClass('is-hidden');
+    // Screen y grows downward: looking from the origin to the far end, the right hand is (-dy, dx).
     turn.el.style.left = `${bx - (dy / len) * TURN_OFFSET}px`;
     turn.el.style.top = `${by + (dx / len) * TURN_OFFSET}px`;
   }
@@ -661,6 +734,11 @@ export class TacticalOverlays {
     return region && { ...region, pinned };
   }
 
+  /**
+   * The parameters of a figure, from the same ones that shape its footprint. No shell is drawn from
+   * them today — the volume is to become a per-measurement choice — but the effect fill still needs
+   * its origin, reach and direction, so this stays.
+   */
   private volumeSpecOf(d: MeasureDisplay, region: MeasureRegion, rctx: RegionContext): VolumeSpec | null {
     const rules = rctx.rules;
     const ceiling = Number.isFinite(rctx.maxLayer) ? rctx.maxLayer * rctx.map.layerHeight : Infinity;
@@ -691,7 +769,6 @@ export class TacticalOverlays {
     try {
       this.still = this.host.win.matchMedia('(prefers-reduced-motion: reduce)').matches;
     } catch { this.still = false; }
-
     const ctxKey = contextKey(ctx);
     const all = active ? [...pinned, active] : [...pinned];
     const wanted = new Set(all.map((r) => r.id));
@@ -703,27 +780,26 @@ export class TacticalOverlays {
         this.entries.delete(id);
       }
     }
-
     const darkCells = new Set<string>();
     for (const r of all) {
       if ((this.effects.get(r.id) ?? null) === 'shadow') {
         for (const c of r.cells) darkCells.add(cellKey(c.cx, c.cz));
       }
     }
-
     const anchors = this.anchorsFor(all, ctx, points);
     for (const region of all) {
       const a = anchors.get(region.id) ?? null;
       const effect = this.effects.get(region.id) ?? null;
       const sig = regionSignature(region, ctxKey) + JSON.stringify([
-        a?.top ?? null, a?.config ?? null, a?.end ?? null,
+        a?.top ?? null, a?.config ?? null, a?.configY ?? null, a?.end ?? null,
         a?.resizable ?? false, a?.turnable ?? false,
         this.onOpenMeasurePopover !== null, effect, this.volumes.get(region.id) ?? null,
       ]);
       const existing = this.entries.get(region.id);
       if (existing && existing.signature === sig) { this.applyFade(existing, fading.has(region.id)); continue; }
       if (existing) { this.disposeEntry(existing); this.entries.delete(region.id); }
-
+      // One measurement that cannot be drawn is skipped, not allowed to take the whole pass down:
+      // a throw here used to blank every measurement on the map, not just the one that failed.
       let entry: Entry;
       try {
         entry = this.buildEntry(region, ctx, a, effect, darkCells);
@@ -757,12 +833,17 @@ export class TacticalOverlays {
     for (const [mat, base] of entry.baseOpacity) {
       (mat as THREE.Material & { opacity: number }).opacity = base;
     }
-    for (const s of entry.strokes) {
-      const m = s.mesh.material as THREE.ShaderMaterial;
-      const base = entry.baseOpacity.get(m);
-      if (base !== undefined) m.uniforms.uOpacity!.value = base;
-    }
+    this.fadeRuler(entry, 1);
     (entry.fx as FadeableFill | null)?.setFade?.(1);
+  }
+
+  /** The ruler's ink fades through its own uniform: a raw shader has no `opacity` to set. */
+  private fadeRuler(entry: Entry, factor: number): void {
+    const ink = entry.ruler;
+    if (!ink) return;
+    ink.ribbon.mat.uniforms.uOpacity!.value = factor;
+    ink.nodes.mat.uniforms.uOpacity!.value = factor;
+    if (ink.hollow) ink.hollow.mat.uniforms.uOpacity!.value = factor;
   }
 
   private clearMeasure(): void {
@@ -777,7 +858,7 @@ export class TacticalOverlays {
     entry.group.removeFromParent();
     entry.fx?.dispose(); entry.fx = null;
     entry.glow = null;
-    entry.strokes.length = 0;
+    entry.ruler = null;
     for (const g of entry.geoms) g.dispose();
     for (const m of entry.mats) m.dispose();
     for (const i of entry.insts) i.dispose();
@@ -809,17 +890,17 @@ export class TacticalOverlays {
     effectRaw: string | null, darkCells: ReadonlySet<string>,
   ): Entry {
     const entry: Entry = {
-      id: region.id, group: new THREE.Group(), pills: [], handles: [], strokes: [],
-      geoms: [], mats: [], insts: [], fx: null, glow: null,
+      id: region.id, group: new THREE.Group(), pills: [], handles: [],
+      geoms: [], mats: [], insts: [], fx: null, glow: null, ruler: null,
       signature: '', fadeStart: null, baseOpacity: new Map(),
     };
     const effect: MeasureEffect | undefined = readMeasureEffect(effectRaw);
-    const baseColor = region.color ?? (effect ? MEASURE_EFFECT_STARTS[effect].color : null);
-    const color = new THREE.Color(resolveMeasureColor(baseColor, this.host));
+    // NULL MEANS THE THEME'S ACCENT, with an effect too. MEASURE_EFFECT_STARTS tells whether the
+    // look gives light or darkness; its colour is what the picker writes, not what we impose.
+    const color = new THREE.Color(resolveMeasureColor(region.color ?? null, this.host));
     const hex = `#${color.getHexString()}`;
     const ceilingY = this.ceilingOf(ctx);
     const spec = this.volumes.get(region.id) ?? null;
-
     if (effect && region.outline.length > 0) {
       const origin = spec
         ? (spec.kind === 'dome' ? { x: spec.centre[0], z: spec.centre[2] }
@@ -835,7 +916,7 @@ export class TacticalOverlays {
       const baseY = Number.isFinite(top) ? top : this.surfaceY(ctx, origin.x, origin.z, ceilingY);
       const fx = buildEffectFill(region.outline, {
         effect, color: hex, layout: ctx.layout, origin, reach, towards,
-        baseY: baseY + FILL_LIFT,
+        baseY,
         cells: region.cells,
         layerHeight: ctx.map.layerHeight,
         seed: region.id,
@@ -847,9 +928,7 @@ export class TacticalOverlays {
         if (this.still) fx.setStill(true); else fx.setTime(this.clock.seconds);
       }
     }
-
     const covered = this.drawRegionBody(entry, region, ctx, color, ceilingY, effect !== undefined);
-
     if (effect && MEASURE_EFFECT_STARTS[effect].light !== null && a) {
       const ox = a.centre.x, oz = a.centre.z;
       const ocx = Math.floor(ox - ctx.layout.originX), ocz = Math.floor(oz - ctx.layout.originZ);
@@ -866,25 +945,21 @@ export class TacticalOverlays {
       entry.group.add(glow);
       entry.glow = { mat: gm, blocked, flick: MEASURE_EFFECT_STARTS[effect].light === 'flicker' };
     }
-
     if (region.path) this.drawPath(entry, region.path, ctx, color, ceilingY);
-
     for (const ring of region.rings) {
       const ringColor = ring.color ? new THREE.Color(resolveColorHex(ring.color)) : color;
       const mat = this.trackMat(entry, new THREE.MeshBasicMaterial({
-        color: ringColor, transparent: true, opacity: BORDER_OPACITY, depthWrite: false, side: THREE.DoubleSide,
-      }), BORDER_OPACITY);
+        color: ringColor, transparent: true, opacity: STROKE_OPACITY, depthWrite: false, side: THREE.DoubleSide,
+      }), STROKE_OPACITY);
       this.drawRingOutline(entry, ring.outline, ctx, mat, ceilingY, covered);
       this.addLabel(entry, ring.labelAt, ring.label, undefined, `#${ringColor.getHexString()}`);
     }
     for (const leg of region.legs) this.addLabel(entry, leg.at, leg.label, undefined, hex);
-
     let labelAt: WorldPoint;
     if (region.path && region.path.length > 0) labelAt = region.path[region.path.length - 1]!;
     else if (a?.top) labelAt = [a.top.x, this.regionTop(region, ctx, a.top, ceilingY), a.top.z];
     else labelAt = this.fallbackAnchor(region, ctx, ceilingY);
     this.addLabel(entry, labelAt, region.label, region.subLabel, hex);
-
     if (region.pinned && a?.config && this.onOpenMeasurePopover) {
       this.addOriginBadge(entry, region, a, hex, ceilingY, ctx);
     }
@@ -944,14 +1019,28 @@ export class TacticalOverlays {
         ? Math.hypot(farPoint[0] - originPoint[0], farPoint[2] - originPoint[2]) : 0;
       const reach = isAura ? (region.aura as number) / (unit > 0 ? unit : 1) : areaLength;
       const top = region.outline.length > 0 ? outlinePointAt(region.outline, OUTLINE_UP, centre) : null;
-      const end = region.outline.length > 0 ? outlinePointAt(region.outline, direction, centre) : null;
+      // Atlas puts a drawn area's far handle at its OWN second point, not at a vertex of the
+      // outline: a 32-sided circle has a vertex every 11.25°, so picking one made the handle jump
+      // around the rim instead of following the pointer. An aura's area IS grown cells, so its
+      // handle stands on the staircase.
+      const end = isAura
+        ? (region.outline.length > 0 ? outlinePointAt(region.outline, direction, centre) : null)
+        : (farPoint ? { x: farPoint[0], z: farPoint[2] } : null);
+      // The badge shares the ink's own first vertex, so the two are coincident at any zoom or
+      // bearing. A ruler's stroke is built from `region.path`, so that is the point it takes.
+      const startPoint = region.path?.[0] ?? originPoint;
       const config = bearer && rim
         ? { x: bearer.x + rim.x, z: bearer.z + rim.z }
-        : (originPoint ? { x: originPoint[0], z: originPoint[2] } : null);
+        : (startPoint ? { x: startPoint[0], z: startPoint[2] } : null);
+      const configY = bearer ? null : (startPoint ? startPoint[1] : null);
       const resizable = this.onMeasureResize !== null && region.pinned && region.mode !== 'ruler'
         && region.mode !== 'ranges' && end !== null;
+      // A circle looks the same at any angle, and a ruler's distance follows the diagonal rule, so
+      // neither has a turn handle — Atlas' own rule.
       const turnable = resizable && region.mode !== 'circle' && reach > 1e-6;
-      out.set(region.id, { top, config, end, centre, direction, bearer, rim, offset, reach, resizable, turnable });
+      out.set(region.id, {
+        top, config, configY, end, centre, direction, bearer, rim, offset, reach, resizable, turnable,
+      });
     }
     return out;
   }
@@ -986,10 +1075,9 @@ export class TacticalOverlays {
     const cells = region.cells;
     const corners = new Map<string, number>();
     if (cells.length === 0) return corners;
-
     const borderMat = this.trackMat(entry, new THREE.MeshBasicMaterial({
-      color, transparent: true, opacity: BORDER_OPACITY, depthWrite: false, side: THREE.DoubleSide,
-    }), BORDER_OPACITY);
+      color, transparent: true, opacity: STROKE_OPACITY, depthWrite: false, side: THREE.DoubleSide,
+    }), STROKE_OPACITY);
     const riserMat = this.trackMat(entry, new THREE.MeshBasicMaterial({
       color, transparent: true, opacity: RISER_OPACITY, depthWrite: false, side: THREE.DoubleSide,
     }), RISER_OPACITY);
@@ -999,7 +1087,6 @@ export class TacticalOverlays {
     const washMat = withEffect ? null : this.trackMat(entry, new THREE.MeshBasicMaterial({
       color, transparent: true, opacity: WASH_OPACITY, depthWrite: false, side: THREE.DoubleSide,
     }), WASH_OPACITY);
-
     const groups = new Map<number, AreaCell[]>();
     for (const cell of cells) {
       const key = heightBucket(cell.y);
@@ -1012,10 +1099,6 @@ export class TacticalOverlays {
         if (held === undefined || y > held) corners.set(ck, y);
       }
     }
-
-    // The owner of a stroke piece is the NEAREST covered cell, by index and a two-cell spiral:
-    // an analytic ring bulges past the cells the rule covers, so the cell under a piece may be
-    // none. Its height is what the stroke takes, never the column's highest surface.
     const byKey = new Map<string, AreaCell[]>();
     for (const c of cells) {
       const k = cellKey(c.cx, c.cz);
@@ -1043,14 +1126,16 @@ export class TacticalOverlays {
       }
       return null;
     };
-
     const washFlats: AreaCell[] = [];
     const tileFlats: AreaCell[] = [];
     const riserPts: number[] = [];
-    const halfBorder = borderWidthOf(ctx.gridSize) / 2;
+    const width = strokeWidth();
+    // Risers belong to a GROWN cell set — an aura or a range ring — whose area is cells and whose
+    // boundary therefore runs along cell edges at every step. A beam is a drawn rectangle: its
+    // outline happens to be its cells' staircase, so treating it as stepped too stroked the same
+    // boundary twice, once as the ring and once as risers.
     const stepped = (typeof region.follows === 'string' && region.follows !== '')
-      || region.mode === 'ranges' || region.mode === 'line';
-
+      || region.mode === 'ranges';
     for (const [, group] of groups) {
       for (const cell of group) {
         if (cell.slope === undefined) {
@@ -1063,14 +1148,12 @@ export class TacticalOverlays {
       }
       if (stepped) {
         for (const edge of this.borderEdgesOf(group)) {
-          this.pushRiser(riserPts, ctx, edge, ceilingY, halfBorder);
+          this.pushRiser(riserPts, ctx, edge, ceilingY, width / 2);
         }
       }
     }
-
     if (washMat) this.instanceCells(entry, washFlats, washMat, 0, WASH_LIFT, WASH_ORDER);
     this.instanceCells(entry, tileFlats, cellMat, -1, FILL_LIFT, FILL_ORDER);
-
     if (riserPts.length > 0) {
       const g = this.trackGeom(entry, new THREE.BufferGeometry());
       g.setAttribute('position', new THREE.Float32BufferAttribute(riserPts, 3));
@@ -1078,11 +1161,12 @@ export class TacticalOverlays {
       m.renderOrder = RISER_ORDER;
       entry.group.add(m);
     }
-
-    // ONE pass for the whole outline. Per height group, a piece with no owner was skipped by
-    // none of them and so drawn by all of them, blending twice and reading thicker.
+    // ONE pass for the whole outline, heights per vertex from the nearest covered cell.
     const borderPts: number[] = [];
-    this.pushShapeBorder(borderPts, ctx, region.outline, ownerAt, ceilingY, halfBorder);
+    this.pushRingStroke(borderPts, region.outline, width, (x, z) => {
+      const owner = ownerAt(x, z);
+      return (owner !== null ? this.cellY(ctx, owner, x, z) : this.surfaceY(ctx, x, z, ceilingY)) + BORDER_LIFT;
+    });
     if (borderPts.length > 0) {
       const g = this.trackGeom(entry, new THREE.BufferGeometry());
       g.setAttribute('position', new THREE.Float32BufferAttribute(borderPts, 3));
@@ -1094,45 +1178,60 @@ export class TacticalOverlays {
   }
 
   /**
-   * The area's outline as a closed band of constant width, mitred at each corner and walked in
-   * short pieces so a height step is met where it happens. Consecutive pieces share exact
-   * vertices: they tile without overlap and without gap, so a transparent stroke never blends
-   * twice and no corner is left with a notch. Each piece is flat at its owner's height.
+   * A closed ring stroked as ONE mitred band of constant width, with a round disc at every vertex
+   * for the join. Consecutive quads share exact vertices, so they tile without gap; the material is
+   * opaque, so a join disc overlapping the band never blends twice. No prolongations, no walking
+   * step: those are what beaded a circle and spiked a cone's apex.
+   *
+   * Heights are taken per VERTEX, so a band crossing a step tilts with the terrain rather than
+   * tearing between two edges that disagree about the height of their shared corner.
    */
-  private pushShapeBorder(
+  private pushRingStroke(
     pts: number[],
-    ctx: TacticalOverlayContext,
     rings: readonly PlanRing[],
-    ownerAt: (x: number, z: number) => AreaCell | null,
-    ceilingY: number,
-    half: number,
+    width: number,
+    yAt: (x: number, z: number) => number,
   ): void {
+    const half = width / 2;
     for (const ring of rings) {
-      if (ring.length < 3) continue;
-      const { outer, inner } = ringBand(ring, half);
-      for (let i = 0; i < ring.length; i++) {
-        const j = (i + 1) % ring.length;
-        const o0 = outer[i]!, o1 = outer[j]!;
-        const n0 = inner[i]!, n1 = inner[j]!;
-        const span = Math.hypot(o1.x - o0.x, o1.z - o0.z);
-        const steps = Math.max(1, Math.ceil(span / BORDER_STEP));
-        for (let s = 0; s < steps; s++) {
-          const t0 = s / steps, t1 = (s + 1) / steps;
-          const oa = lerpP(o0, o1, t0), ob = lerpP(o0, o1, t1);
-          const ia = lerpP(n0, n1, t0), ib = lerpP(n0, n1, t1);
-          const mx = (oa.x + ob.x + ia.x + ib.x) / 4;
-          const mz = (oa.z + ob.z + ia.z + ib.z) / 4;
-          const owner = ownerAt(mx, mz);
-          const y = (owner !== null
-            ? this.cellY(ctx, owner, mx, mz)
-            : this.surfaceY(ctx, mx, mz, ceilingY)) + BORDER_LIFT;
+      const n = ring.length;
+      if (n < 3) continue;
+      const lx: number[] = [], lz: number[] = [], rx: number[] = [], rz: number[] = [];
+      const ys: number[] = [];
+      for (let i = 0; i < n; i++) {
+        const prev = ring[(i - 1 + n) % n]!;
+        const v = ring[i]!;
+        const next = ring[(i + 1) % n]!;
+        const n1 = leftOf(v.x - prev.x, v.z - prev.z);
+        const n2 = leftOf(next.x - v.x, next.z - v.z);
+        let mx = n1.x + n2.x, mz = n1.z + n2.z;
+        const ml = Math.hypot(mx, mz);
+        let scale = half;
+        if (ml > 1e-9) {
+          mx /= ml; mz /= ml;
+          scale = half / Math.max(MITRE_COS_FLOOR, mx * n2.x + mz * n2.z);
+        } else { mx = n2.x; mz = n2.z; }
+        lx.push(v.x + mx * scale); lz.push(v.z + mz * scale);
+        rx.push(v.x - mx * scale); rz.push(v.z - mz * scale);
+        ys.push(yAt(v.x, v.z));
+      }
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n;
+        const y0 = ys[i]!, y1 = ys[j]!;
+        pts.push(
+          lx[i]!, y0, lz[i]!, rx[i]!, y0, rz[i]!, rx[j]!, y1, rz[j]!,
+          lx[i]!, y0, lz[i]!, rx[j]!, y1, rz[j]!, lx[j]!, y1, lz[j]!,
+        );
+      }
+      for (let i = 0; i < n; i++) {
+        const v = ring[i]!, y = ys[i]!;
+        for (let k = 0; k < DISC_SEGMENTS; k++) {
+          const a0 = (k / DISC_SEGMENTS) * Math.PI * 2;
+          const a1 = ((k + 1) / DISC_SEGMENTS) * Math.PI * 2;
           pts.push(
-            oa.x, y, oa.z,
-            ia.x, y, ia.z,
-            ib.x, y, ib.z,
-            oa.x, y, oa.z,
-            ib.x, y, ib.z,
-            ob.x, y, ob.z,
+            v.x, y, v.z,
+            v.x + Math.cos(a0) * half, y, v.z + Math.sin(a0) * half,
+            v.x + Math.cos(a1) * half, y, v.z + Math.sin(a1) * half,
           );
         }
       }
@@ -1199,32 +1298,17 @@ export class TacticalOverlays {
     entry.group.add(m);
   }
 
-  /** A range ring's outline, the same mitred band, on the surfaces the body covers. */
+  /** A range ring's outline, stroked as the body's is, on the surfaces the body covers. */
   private drawRingOutline(
     entry: Entry, rings: readonly PlanRing[], ctx: TacticalOverlayContext,
     mat: THREE.Material, ceilingY: number, covered: ReadonlyMap<string, number>,
   ): void {
     if (rings.length === 0) return;
-    const half = borderWidthOf(ctx.gridSize) / 2;
     const pts: number[] = [];
-    const yAt = (x: number, z: number): number => {
+    this.pushRingStroke(pts, rings, strokeWidth(), (x, z) => {
       const held = covered.get(cornerKey(x, z));
       return (held !== undefined ? held : this.surfaceY(ctx, x, z, ceilingY)) + BORDER_LIFT;
-    };
-    for (const ring of rings) {
-      if (ring.length < 3) continue;
-      const { outer, inner } = ringBand(ring, half);
-      for (let i = 0; i < ring.length; i++) {
-        const j = (i + 1) % ring.length;
-        const o0 = outer[i]!, o1 = outer[j]!;
-        const n0 = inner[i]!, n1 = inner[j]!;
-        const y0 = yAt(ring[i]!.x, ring[i]!.z), y1 = yAt(ring[j]!.x, ring[j]!.z);
-        pts.push(
-          o0.x, y0, o0.z, n0.x, y0, n0.z, n1.x, y1, n1.z,
-          o0.x, y0, o0.z, n1.x, y1, n1.z, o1.x, y1, o1.z,
-        );
-      }
-    }
+    });
     if (pts.length === 0) return;
     const g = this.trackGeom(entry, new THREE.BufferGeometry());
     g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
@@ -1235,17 +1319,23 @@ export class TacticalOverlays {
 
   // ---- the ruler, in screen pixels --------------------------------------------------------------
   /**
-   * A ruler: one coloured stroke of constant width IN PIXELS, with round caps that stand in for
-   * its nodes; and a dashed drop wherever a corner stands above the ground. No casing.
+   * A ruler: its path stroked with round joins, a dot at every point, and the origin's dot one
+   * larger and hollow around a white middle — `drawMeasurement` and `drawMeasurePoint`. Plus our
+   * own dashed drop wherever a corner stands above the ground, which Atlas has no need of on a flat
+   * map. Three drawables, not one per node: a 64-corner ruler is still three draw calls.
    */
   private drawPath(
     entry: Entry, path: readonly WorldPoint[], ctx: TacticalOverlayContext,
     color: THREE.Color, ceilingY: number,
   ): void {
     if (path.length < 2) return;
+    const hex = `#${color.getHexString()}`;
     const lifted = path.map((p) => [p[0], p[1] + PATH_LIFT, p[2]] as WorldPoint);
-    this.addRulerStroke(entry, lifted, RULER_HALF_PX, RULER_CAP_PX, color, BORDER_OPACITY, PATH_ORDER);
-
+    const n = lifted.length;
+    const ribbon = this.inkPart(entry, (n - 1) * 6 + n * DISC_SEGMENTS * 3, hex, PATH_ORDER);
+    const nodes = this.inkPart(entry, n * DISC_SEGMENTS * 3, hex, NODE_ORDER);
+    const hollow = this.inkPart(entry, DISC_SEGMENTS * 3, HOLLOW_MIDDLE, NODE_ORDER + 0.01);
+    entry.ruler = { path: lifted, widthWorld: strokeWidth(), ribbon, nodes, hollow };
     const dropMat = this.trackMat(entry, new THREE.LineDashedMaterial({
       color, transparent: true, opacity: 0.5, dashSize: 0.14, gapSize: 0.08, depthTest: false,
     }), 0.5);
@@ -1264,71 +1354,81 @@ export class TacticalOverlays {
     }
   }
 
-  private addRulerStroke(
-    entry: Entry, path: readonly WorldPoint[], halfPx: number, capPx: number,
-    color: THREE.Color, opacity: number, order: number,
-  ): void {
-    const segments = path.length - 1;
-    const verts = segments * 6 + 2 * CAP_SEGMENTS * 3;
-    const arr = new Float32Array(verts * 3);
-    const attr = new THREE.BufferAttribute(arr, 3);
+  /**
+   * One screen-space drawable: its buffer is allocated once and refilled every frame. The depth test
+   * is ON and each vertex carries its own projected depth, so terrain occludes the ruler exactly as
+   * it occludes an area — a stroke that ignored depth slid over walls as the camera turned.
+   */
+  private inkPart(entry: Entry, verts: number, hex: string, order: number): InkPart {
+    const attr = new THREE.BufferAttribute(new Float32Array(verts * 3), 3);
     attr.setUsage(THREE.DynamicDrawUsage);
     const geom = this.trackGeom(entry, new THREE.BufferGeometry());
     geom.setAttribute('position', attr);
     const mat = this.trackMat(entry, new THREE.ShaderMaterial({
-      uniforms: {
-        uColor: { value: new THREE.Vector3(color.r, color.g, color.b) },
-        uOpacity: { value: opacity },
-      },
+      uniforms: { uColor: { value: srgbVector(hex) }, uOpacity: { value: 1 } },
       vertexShader: SCREEN_VERTEX, fragmentShader: SCREEN_FRAGMENT,
-      transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide,
-    }), opacity);
+      transparent: true, depthTest: true, depthWrite: false, side: THREE.DoubleSide,
+    }), 1);
     const mesh = new THREE.Mesh(geom, mat);
+    // The positions are NDC, not world: a bounding sphere at the origin would be culled away.
     mesh.frustumCulled = false;
     mesh.renderOrder = order;
     entry.group.add(mesh);
-    entry.strokes.push({ path, mesh, attr, halfPx, capPx });
+    return { mesh, attr, mat };
+  }
+
+  /** Screen pixels per world unit at a point, read along the camera's own right axis. */
+  private pxPerUnitAt(camera: THREE.Camera, at: WorldPoint, width: number, height: number): number {
+    this.pa.set(at[0], at[1], at[2]).project(camera);
+    const ax = (this.pa.x * 0.5 + 0.5) * width, ay = (-this.pa.y * 0.5 + 0.5) * height;
+    this.pc.setFromMatrixColumn(camera.matrixWorld, 0);
+    this.pb.set(at[0] + this.pc.x, at[1] + this.pc.y, at[2] + this.pc.z).project(camera);
+    const bx = (this.pb.x * 0.5 + 0.5) * width, by = (-this.pb.y * 0.5 + 0.5) * height;
+    const d = Math.hypot(bx - ax, by - ay);
+    return Number.isFinite(d) && d > 1e-3 ? d : FALLBACK_PX_PER_UNIT;
   }
 
   /**
-   * Refill one stroke from the projected path, in pixels, written as NDC. There is no perspective
-   * term here, so the width is the same at both ends at any zoom, bearing or depth.
+   * Refill the ruler's ink from the projected path, in pixels, written as NDC with each point's own
+   * depth. The stroke's width is the AREA BORDER's world width turned into pixels at the current
+   * zoom, so the ruler reads as thick as the other tools; the dots keep Atlas' proportions to it.
    *
    * An END of the path has only one segment and takes that segment's own normal at the full half
    * width. Running the mitre formula there divides by a zero cosine, clamps to the floor, and
    * offsets that point FOUR times as far as the other end — which is what made the ruler a wedge.
    */
-  private fillRulerStroke(s: RulerStroke, camera: THREE.Camera, width: number, height: number): void {
-    const n = s.path.length;
-    const sx: number[] = [];
-    const sy: number[] = [];
+  private fillRuler(ink: RulerInk, camera: THREE.Camera, width: number, height: number): void {
+    const n = ink.path.length;
+    const scale = this.pxPerUnitAt(camera, ink.path[0]!, width, height);
+    const strokePx = Math.max(MIN_STROKE_PX, ink.widthWorld * scale);
+    const half = strokePx / 2;
+    const dotPx = Math.max(INK_DOT_PX, half * 4);
+    const originPx = dotPx + Math.max(1, half);
+    const innerPx = Math.max(half * 0.5, originPx - strokePx);
+    const sx: number[] = [], sy: number[] = [], sz: number[] = [];
     let visible = true;
-    for (const p of s.path) {
+    for (const p of ink.path) {
       this.pa.set(p[0], p[1], p[2]).project(camera);
       if (this.pa.z <= -1 || this.pa.z >= 1) visible = false;
       sx.push((this.pa.x * 0.5 + 0.5) * width);
       sy.push((-this.pa.y * 0.5 + 0.5) * height);
+      sz.push(this.pa.z);
     }
-    s.mesh.visible = visible;
+    ink.ribbon.mesh.visible = visible;
+    ink.nodes.mesh.visible = visible;
+    if (ink.hollow) ink.hollow.mesh.visible = visible;
     if (!visible) return;
-
-    const arr = s.attr.array as Float32Array;
-    let at = 0;
-    const put = (x: number, y: number): void => {
-      arr[at++] = (x / width) * 2 - 1;
-      arr[at++] = 1 - (y / height) * 2;
-      arr[at++] = 0;
-    };
-
     const lx: number[] = [], ly: number[] = [], rx: number[] = [], ry: number[] = [];
     for (let i = 0; i < n; i++) {
-      const pi = Math.max(0, i - 1), ni = Math.min(n - 1, i + 1);
-      const d1x = sx[i]! - sx[pi]!, d1y = sy[i]! - sy[pi]!;
-      const d2x = sx[ni]! - sx[i]!, d2y = sy[ni]! - sy[i]!;
+      const pi = i - 1, ni = i + 1;
+      const d1x = pi >= 0 ? sx[i]! - sx[pi]! : 0;
+      const d1y = pi >= 0 ? sy[i]! - sy[pi]! : 0;
+      const d2x = ni < n ? sx[ni]! - sx[i]! : 0;
+      const d2y = ni < n ? sy[ni]! - sy[i]! : 0;
       const l1 = Math.hypot(d1x, d1y), l2 = Math.hypot(d2x, d2y);
-      const has1 = l1 > 1e-6, has2 = l2 > 1e-6;
+      const ok1 = l1 > 1e-6, ok2 = l2 > 1e-6;
       let ox = 0, oy = 0;
-      if (has1 && has2) {
+      if (ok1 && ok2) {
         const n1x = -d1y / l1, n1y = d1x / l1;
         const n2x = -d2y / l2, n2y = d2x / l2;
         let mx = n1x + n2x, my = n1y + n2y;
@@ -1338,35 +1438,60 @@ export class TacticalOverlays {
           const cos = Math.max(MITRE_COS_FLOOR, mx * n2x + my * n2y);
           ox = mx / cos; oy = my / cos;
         } else { ox = n2x; oy = n2y; }
-      } else if (has2) {
-        ox = -d2y / l2; oy = d2x / l2;
-      } else if (has1) {
-        ox = -d1y / l1; oy = d1x / l1;
-      }
-      lx.push(sx[i]! + ox * s.halfPx); ly.push(sy[i]! + oy * s.halfPx);
-      rx.push(sx[i]! - ox * s.halfPx); ry.push(sy[i]! - oy * s.halfPx);
+      } else if (ok2) { ox = -d2y / l2; oy = d2x / l2; }
+      else if (ok1) { ox = -d1y / l1; oy = d1x / l1; }
+      lx.push(sx[i]! + ox * half); ly.push(sy[i]! + oy * half);
+      rx.push(sx[i]! - ox * half); ry.push(sy[i]! - oy * half);
     }
+    const writer = (part: InkPart): ((x: number, y: number, z: number) => void) => {
+      const arr = part.attr.array as Float32Array;
+      let at = 0;
+      return (x: number, y: number, z: number): void => {
+        arr[at++] = (x / width) * 2 - 1;
+        arr[at++] = 1 - (y / height) * 2;
+        arr[at++] = z;
+      };
+    };
+    const disc = (
+      put: (x: number, y: number, z: number) => void,
+      cx: number, cy: number, cz: number, r: number,
+    ): void => {
+      for (let k = 0; k < DISC_SEGMENTS; k++) {
+        const a0 = (k / DISC_SEGMENTS) * Math.PI * 2;
+        const a1 = ((k + 1) / DISC_SEGMENTS) * Math.PI * 2;
+        put(cx, cy, cz);
+        put(cx + Math.cos(a0) * r, cy + Math.sin(a0) * r, cz);
+        put(cx + Math.cos(a1) * r, cy + Math.sin(a1) * r, cz);
+      }
+    };
+    const wr = writer(ink.ribbon);
     for (let i = 0; i + 1 < n; i++) {
-      put(lx[i]!, ly[i]!); put(rx[i]!, ry[i]!); put(rx[i + 1]!, ry[i + 1]!);
-      put(lx[i]!, ly[i]!); put(rx[i + 1]!, ry[i + 1]!); put(lx[i + 1]!, ly[i + 1]!);
+      const z0 = sz[i]!, z1 = sz[i + 1]!;
+      wr(lx[i]!, ly[i]!, z0); wr(rx[i]!, ry[i]!, z0); wr(rx[i + 1]!, ry[i + 1]!, z1);
+      wr(lx[i]!, ly[i]!, z0); wr(rx[i + 1]!, ry[i + 1]!, z1); wr(lx[i + 1]!, ly[i + 1]!, z1);
     }
-    for (const end of [0, n - 1]) {
-      const cx = sx[end]!, cy = sy[end]!;
-      for (let k = 0; k < CAP_SEGMENTS; k++) {
-        const a0 = (k / CAP_SEGMENTS) * Math.PI * 2;
-        const a1 = ((k + 1) / CAP_SEGMENTS) * Math.PI * 2;
-        put(cx, cy);
-        put(cx + Math.cos(a0) * s.capPx, cy + Math.sin(a0) * s.capPx);
-        put(cx + Math.cos(a1) * s.capPx, cy + Math.sin(a1) * s.capPx);
-      }
+    // A round disc at every vertex is both the round join and the round cap. The accent is opaque,
+    // so where a disc overlaps the ribbon nothing blends twice.
+    for (let i = 0; i < n; i++) disc(wr, sx[i]!, sy[i]!, sz[i]!, half);
+    ink.ribbon.attr.needsUpdate = true;
+    const wn = writer(ink.nodes);
+    for (let i = 1; i < n; i++) disc(wn, sx[i]!, sy[i]!, sz[i]!, dotPx);
+    disc(wn, sx[0]!, sy[0]!, sz[0]!, originPx);
+    ink.nodes.attr.needsUpdate = true;
+    if (ink.hollow) {
+      const wh = writer(ink.hollow);
+      disc(wh, sx[0]!, sy[0]!, sz[0]!, innerPx);
+      ink.hollow.attr.needsUpdate = true;
     }
-    s.attr.needsUpdate = true;
   }
 
   // ---- the label: text only, takes no pointer --------------------------------------------------
   private addLabel(entry: Entry, at: WorldPoint, main: string, sub: string | undefined, hex: string): void {
     if (main === '') return;
     const el = this.labelLayer.createDiv({ cls: 'atlas3d-tactical-pill atlas3d-measure-label' });
+    // A new element has no left/top until updateScreenLabels places it. Visible before that, it
+    // paints one frame at the layer's static origin — the corner — which is the blink on rebuild.
+    el.addClass('is-hidden');
     el.style.setProperty(PILL_COLOR_VAR, hex);
     el.style.pointerEvents = 'none';
     el.style.display = 'inline-flex';
@@ -1376,7 +1501,7 @@ export class TacticalOverlays {
     el.style.borderRadius = '999px';
     el.style.background = plateRgba(canvasBadgeTheme(this.host).background, 0.95);
     el.style.border = `1px solid ${hex}`;
-    el.style.boxShadow = '0 2px 8px -3px rgba(0,0,0,.8)';
+    el.style.boxShadow = '0 0 0 1px rgba(0,0,0,.35), 0 2px 8px -3px rgba(0,0,0,.8)';
     el.style.fontFamily = 'var(--font-monospace, ui-monospace, monospace)';
     el.style.fontSize = '11px';
     el.style.fontWeight = '700';
@@ -1394,14 +1519,27 @@ export class TacticalOverlays {
   }
 
   // ---- the three handles -----------------------------------------------------------------------
-  private handleShell(cls: string, radius: number, hit: number, hex: string, title: string): { el: HTMLElement; ring: HTMLElement } {
+  /**
+   * The shared shell, as MeasureHandles.draw() draws it: a dark hairline outside the plate, the
+   * theme's plate at 0.95, and the coloured ring stroked INSIDE the plate's edge — not flush with
+   * it. Atlas leaves half a pixel of plate outside the ring, which is what makes the dot read as a
+   * disc wearing a ring rather than a coloured circle. The ring's colour is `measureRingColor`:
+   * WCAG contrast 3 against that plate, moved the least it can, so fire keeps its exact hue.
+   */
+  private handleShell(
+    cls: string, radius: number, hit: number, hex: string, title: string,
+    ringInset = RING_INSET, ringWidth = RING_WIDTH,
+  ): { el: HTMLElement; ring: HTMLElement } {
     const theme = canvasBadgeTheme(this.host);
     const tint = measureRingColor(hex, this.host);
+    const r = radius * HANDLE_SCALE;
+    const size = Math.max(r, hit * HANDLE_SCALE) * 2;
     const el = this.labelLayer.createDiv({
       cls: `atlas3d-measure-handle ${cls}`,
       attr: { role: 'button', tabindex: '0', title, 'aria-label': title },
     });
-    const size = Math.max(radius, hit) * 2;
+    // Born hidden for the same reason a label is: no left/top until it is placed.
+    el.addClass('is-hidden');
     el.style.pointerEvents = 'auto';
     el.style.position = 'absolute';
     el.style.width = `${size}px`;
@@ -1414,17 +1552,30 @@ export class TacticalOverlays {
     el.style.border = '0';
     el.style.padding = '0';
     const ring = el.createDiv();
-    ring.style.width = `${radius * 2}px`;
-    ring.style.height = `${radius * 2}px`;
+    ring.style.position = 'relative';
+    ring.style.width = `${r * 2}px`;
+    ring.style.height = `${r * 2}px`;
     ring.style.borderRadius = '50%';
     ring.style.boxSizing = 'border-box';
     ring.style.display = 'grid';
     ring.style.placeItems = 'center';
     ring.style.background = plateRgba(theme.background, 0.95);
-    ring.style.border = `1.5px solid ${tint}`;
-    ring.style.boxShadow = '0 1px 5px -1px rgba(0,0,0,.85)';
+    ring.style.boxShadow = '0 0 0 1px rgba(0,0,0,.35), 0 1px 5px -1px rgba(0,0,0,.85)';
     ring.style.outlineOffset = '2px';
     ring.style.transition = 'transform .12s';
+    // The coloured band: a stroke of `ringWidth` centred `ringInset` inside the plate's edge.
+    const band = ring.createDiv();
+    const d = Math.max(2, 2 * (r - (ringInset - ringWidth / 2)));
+    band.style.position = 'absolute';
+    band.style.left = `${(r * 2 - d) / 2}px`;
+    band.style.top = `${(r * 2 - d) / 2}px`;
+    band.style.width = `${d}px`;
+    band.style.height = `${d}px`;
+    band.style.border = `${ringWidth}px solid ${tint}`;
+    band.style.borderRadius = '50%';
+    band.style.boxSizing = 'border-box';
+    band.style.opacity = String(RING_ALPHA);
+    band.style.pointerEvents = 'none';
     return { el, ring };
   }
 
@@ -1454,24 +1605,28 @@ export class TacticalOverlays {
     const shape = this.shapes.get(region.id) ?? region.mode;
     const { el, ring } = this.handleShell('is-origin', HANDLE_RADIUS, HANDLE_HIT, hex, 'Measurement options');
     ring.style.cursor = 'pointer';
+    const size = HANDLE_GLYPH * HANDLE_SCALE;
     const glyph = ring.createDiv();
-    glyph.style.width = `${HANDLE_GLYPH}px`;
-    glyph.style.height = `${HANDLE_GLYPH}px`;
+    glyph.style.width = `${size}px`;
+    glyph.style.height = `${size}px`;
     glyph.style.color = badgeInk(this.host);
     glyph.style.display = 'grid';
     glyph.style.placeItems = 'center';
+    glyph.style.pointerEvents = 'none';
     const paths = SHAPE_GLYPH[shape] ?? SHAPE_GLYPH.square!;
     const body = paths.map((d) => `<path d="${d}"/>`).join('');
-    glyph.innerHTML = `<svg width="${HANDLE_GLYPH}" height="${HANDLE_GLYPH}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
-
-    const y = this.regionTop(region, ctx, a.config, ceilingY);
+    glyph.innerHTML = `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
+    // The measurement's OWN first point, at its own height, lifted exactly as the ink is: the badge
+    // and the start of the line are then the same projected point at any zoom or bearing.
+    const y = a.configY !== null ? a.configY : this.regionTop(region, ctx, a.config, ceilingY);
+    const lift = region.path ? PATH_LIFT : BORDER_LIFT;
     const handle: HandleEntry = {
-      el, ring, worldPos: new THREE.Vector3(a.config.x, y + BORDER_LIFT, a.config.z),
+      el, ring, worldPos: new THREE.Vector3(a.config.x, y + lift, a.config.z),
       part: 'origin', hex,
       bearer: a.bearer ? { x: a.bearer.x, z: a.bearer.z } : null,
       rim: a.rim,
       anchor: a.bearer ? { x: a.bearer.x, z: a.bearer.z } : a.centre,
-      direction: a.direction, offset: a.offset, planeY: y + BORDER_LIFT, start: a.reach,
+      direction: a.direction, offset: a.offset, planeY: y + lift, start: a.reach,
       anchorWorld: null,
     };
     const open = (e: Event): void => {
@@ -1487,6 +1642,7 @@ export class TacticalOverlays {
     entry.handles.push(handle);
   }
 
+  /** The far dot. It resizes AND turns; a press on it never opens the popover. */
   private addEndHandle(
     entry: Entry, id: string, a: Anchors, hex: string,
     ceilingY: number, ctx: TacticalOverlayContext,
@@ -1508,23 +1664,28 @@ export class TacticalOverlays {
     entry.handles.push(handle);
   }
 
+  /**
+   * The turn dot: beside the far one, its ring thinner and tighter, and two arrows chasing each
+   * other round it in the badge's ink — `drawTurnHandle`. It ONLY turns.
+   */
   private addTurnHandle(
     entry: Entry, id: string, a: Anchors, hex: string,
     ceilingY: number, ctx: TacticalOverlayContext,
   ): void {
     if (!a.end) return;
-    const { el, ring } = this.handleShell('is-turn', TURN_RADIUS, TURN_HIT, hex, 'Drag to turn the area');
+    const { el, ring } = this.handleShell(
+      'is-turn', TURN_RADIUS, TURN_HIT, hex, 'Drag to turn the area',
+      TURN_RING_INSET, TURN_RING_WIDTH,
+    );
     ring.style.cursor = 'grab';
+    const size = TURN_RADIUS * 2 * HANDLE_SCALE;
     const glyph = ring.createDiv();
-    glyph.style.width = `${TURN_GLYPH}px`;
-    glyph.style.height = `${TURN_GLYPH}px`;
-    glyph.style.color = badgeInk(this.host);
+    glyph.style.width = `${size}px`;
+    glyph.style.height = `${size}px`;
     glyph.style.display = 'grid';
     glyph.style.placeItems = 'center';
     glyph.style.pointerEvents = 'none';
-    const body = TURN_GLYPH_PATHS.map((d) => `<path d="${d}"/>`).join('');
-    glyph.innerHTML = `<svg width="${TURN_GLYPH}" height="${TURN_GLYPH}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
-
+    glyph.innerHTML = turnGlyphSvg(size, badgeInk(this.host));
     const y = this.surfaceY(ctx, a.end.x, a.end.z, ceilingY);
     const anchor = a.bearer ? { x: a.bearer.x, z: a.bearer.z } : a.centre;
     const handle: HandleEntry = {
@@ -1579,6 +1740,11 @@ export class TacticalOverlays {
     win.addEventListener('blur', () => this.endDrag(), { signal });
   }
 
+  /**
+   * The reach AND the way the pointer lies from the anchor. The far dot emits both, so it can be
+   * carried around the area; the turn dot keeps the reach it was grabbed at and emits the way
+   * alone, which is what turns a figure without resizing it.
+   */
   private moveDrag(e: PointerEvent): void {
     const drag = this.drag;
     if (!drag) return;
@@ -1671,6 +1837,8 @@ export class TacticalOverlays {
       this.losGroup.add(marker);
     }
     const pill = this.labelLayer.createDiv({ cls: `atlas3d-tactical-pill atlas3d-los-pill is-${spec.status}` });
+    // Same reason as a measurement's label: it has no place until it is projected.
+    pill.addClass('is-hidden');
     pill.createSpan({ cls: 'atlas3d-tactical-main', text: spec.label });
     if (spec.locked) pill.createSpan({ cls: 'atlas3d-tactical-sub', text: 'Locked (click to reset)' });
     this.losPill = { el: pill, worldPos: new THREE.Vector3(spec.target[0], spec.target[1] + 1.28, spec.target[2]) };

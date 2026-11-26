@@ -16,7 +16,12 @@ import {
 import { TerrainMeshes } from './TerrainMeshes';
 import { ToolOverlays, type GhostSpec, type MoveTargetSpec } from './ToolOverlays';
 
-export type Tool = 'orbit' | 'raise' | 'lower' | 'build' | 'move' | 'measure' | 'los';
+/**
+ * The tools of the 3D map. There is no `orbit`: navigation belongs to the view (the camera keeps
+ * the same buttons in every tool), and the neutral tool is `move` — Atlas' own id — which
+ * selects, drags and deselects. The old OrbitTool is merged into MoveTokenTool.
+ */
+export type Tool = 'raise' | 'lower' | 'build' | 'move' | 'measure' | 'los';
 export type {
   CameraKind,
   GhostSpec,
@@ -49,8 +54,8 @@ export type {
  * per-material clipping planes until the renderer enables them; this is that switch. Materials
  * without planes are unaffected, so nothing else pays for it.
  *
- * `MeasureContextData` carries the map's Snap (a dragged reach fits to whole cells or tenths) and,
- * new, each token's LIFT — its elevation above its own floor in world units. The overlay composes
+ * `MeasureContextData` carries the map's Snap (a dragged reach fits to whole cells or tenths) and
+ * each token's LIFT — its elevation above its own floor in world units. The overlay composes
  * that with the terrain floor it already samples to tell a token inside an area's FOOTPRINT from
  * one its VOLUME actually reaches: a flier 15ft up is in a ground cube's footprint but out of its
  * effect, and only the lift can say so. Unset reads as every token standing on its floor.
@@ -180,7 +185,7 @@ export class SceneRenderer {
     this.overlays.addTo(this.scene);
     this.tactical.addTo(this.scene);
     this.cameraRig = new CameraController(this.canvas, () => this.invalidate());
-    this.setTool('orbit');
+    this.setTool('move');
     this.resize();
   }
 
@@ -372,8 +377,13 @@ export class SceneRenderer {
 
   // ---- camera --------------------------------------------------------------------------
 
-  setTool(tool: Tool): void {
-    this.cameraRig.setOrbitEnabledButtons(tool === 'orbit');
+  /**
+   * Kept for the dispatcher, and deliberately per-tool NO-OP: navigation is the view's, the same
+   * buttons in every tool (right pans, the pressed wheel rotates). The left always belongs to
+   * the active tool, which is what lets one tool select and drag a token while the right pans.
+   */
+  setTool(_tool: Tool): void {
+    this.cameraRig.setOrbitEnabledButtons(false);
   }
 
   setCameraKind(kind: CameraKind): void {

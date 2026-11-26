@@ -7,13 +7,17 @@ import { BuildTool } from './BuildTool';
 import { LosTool } from './LosTool';
 import { MeasureTool } from './MeasureTool';
 import { MoveTokenTool } from './MoveTokenTool';
-import { OrbitTool } from './OrbitTool';
 import { SculptTool } from './SculptTool';
 import { CLICK_SLOP_PX, type BuildState, type MeasureState, type ToolContext, type ToolHandler } from './ToolController';
 
 /**
  * The pointer dispatcher: it owns the canvas listeners and hands each gesture to the active
- * tool (`OrbitTool`, `SculptTool`, `BuildTool`, `MoveTokenTool`, `MeasureTool`, `LosTool`).
+ * tool (`MoveTokenTool`, `SculptTool`, `BuildTool`, `MeasureTool`, `LosTool`).
+ *
+ * THERE IS NO ORBIT TOOL. Navigation belongs to the view — the camera keeps the same buttons
+ * in every tool — and the neutral tool is `move`, which selects, drags and deselects as Atlas'
+ * own move tool does. The old OrbitTool (select + deselect + hover, no drag) is merged into
+ * MoveTokenTool and its file is gone.
  *
  * It also builds the one `ToolContext` every tool reads. The scene's hooks are forwarded here,
  * including the ones that reach Atlas itself: the measurements Atlas already holds, the actions
@@ -79,7 +83,7 @@ export interface InteractionHooks {
  * Lightweight pointer dispatcher delegating to the active tool handler.
  */
 export class Interaction {
-  tool: Tool = 'orbit';
+  tool: Tool = 'move';
   brush = 1;
   private altRemove = false;
   private rightDown: { x: number; y: number } | null = null;
@@ -130,7 +134,6 @@ export class Interaction {
     this.losTool = new LosTool(ctx);
 
     this.handlers = {
-      orbit: new OrbitTool(ctx),
       raise: new SculptTool(ctx, 'raise'),
       lower: new SculptTool(ctx, 'lower'),
       build: new BuildTool(ctx),
@@ -242,7 +245,7 @@ export class Interaction {
     this.rightDown = null;
     if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) >= CLICK_SLOP_PX) return;
     if (this.active().onRightClick?.()) return;
-    if (this.tool !== 'orbit' && this.tool !== 'move') return;
+    if (this.tool !== 'move') return;
     const token = this.view.pickToken(e);
     if (token !== null) this.hooks.onContextMenu(token, e.clientX, e.clientY);
   }

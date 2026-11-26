@@ -1,4 +1,4 @@
-import { snapCenter, type ToolContext, type ToolHandler } from './ToolController';
+import { CLICK_SLOP_PX, snapCenter, type ToolContext, type ToolHandler } from './ToolController';
 
 interface DragState {
   id: string;
@@ -12,12 +12,34 @@ interface DragState {
   targetFloorY: number;
 }
 
+/**
+ * The select-and-move tool: Atlas' own `move`, and the 3D map's only neutral tool.
+ *
+ * MERGED FROM OrbitTool AND MoveTokenTool, which each held half of one gesture. Verified in
+ * both upstreams that this is ONE tool, not two:
+ *
+ *   Atlas  `PixiAppManager.initViewport()` installs its drag plugin ONCE on the viewport —
+ *          `new MouseDrag(viewport, { mouseButtons: 'right', pressDrag: true })`, "The right
+ *          button pans, for a mouse alone" — so selecting and moving a token with the left
+ *          button and navigating with the right are the same tool. Its toolbar catalog has
+ *          one `move` id, no orbit.
+ *   IsoCON `Viewport.cs` puts rotate/pan on right/middle (swapped by `PanWithRight`); the
+ *          left is free for tokens there too.
+ *
+ * So here: a left press on a token selects it IN ATLAS and arms a drag; a clean left click on
+ * empty ground deselects (what OrbitTool did); hover feeds the statblock; double click centers.
+ * The camera is never this tool's — right drag pans and the pressed wheel rotates in EVERY
+ * tool, because CameraController owns the mapping, not the dispatcher.
+ */
 export class MoveTokenTool implements ToolHandler {
   private drag: DragState | null = null;
+  /** The press, for the clean-click deselect when it landed on no token. */
+  private down: { x: number; y: number; token: string | null } | null = null;
 
   constructor(private readonly ctx: ToolContext) {}
 
   onDown(e: PointerEvent, tokenHit: string | null): void {
+    this.down = { x: e.clientX, y: e.clientY, token: tokenHit };
     if (tokenHit === null) return;
     this.ctx.onSelect(tokenHit);
     const diameter = this.ctx.diameterOf(tokenHit);
@@ -112,8 +134,17 @@ export class MoveTokenTool implements ToolHandler {
     });
   }
 
-  onUp(): void {
-    if (!this.drag) return;
+  onUp(e: PointerEvent): void {
+    const down = this.down;
+    this.down = null;
+    if (!this.drag) {
+      // A clean click on empty ground deselects, as the old Orbit tool did. A press that moved
+      // past the slop is not a click and leaves the selection alone.
+      if (down && down.token === null && Math.hypot(e.clientX - down.x, e.clientY - down.y) < CLICK_SLOP_PX) {
+        this.ctx.onSelect(null);
+      }
+      return;
+    }
     const { id, targetPx, targetFloorY } = this.drag;
     this.drag = null;
     this.ctx.view.setMoveTarget(null);
@@ -129,6 +160,7 @@ export class MoveTokenTool implements ToolHandler {
   }
 
   onCancel(): void {
+    this.down = null;
     if (!this.drag) return;
     this.ctx.view.setMoveTarget(null);
     this.ctx.view.previewToken(this.drag.id, null);

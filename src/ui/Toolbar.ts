@@ -6,26 +6,28 @@ import type { CameraKind, Tool, ViewPreset } from '../view/SceneRenderer';
 
 /**
  * The 3D map's own bar. TEMPORARY by design: the goal is Atlas' own buttons driving our tools
- * (which already happens for Measure AND Move, through the store), plus Obsidian's own surfaces
+ * (which already happens for Measure and Move, through the store), plus Obsidian's own surfaces
  * for the rest — `View.addAction` for view-level toggles, commands with hotkeys for the camera,
  * and a `Menu` for the handful of switches. What stays here is what has no home upstream:
  * the terrain tools and the vertical slice.
  *
  * THE CAMERA BELONGS TO THE VIEW, NOT TO A TOOL. Verified in both upstreams: Atlas installs its
- * drag plugin ONCE on the viewport (`new MouseDrag(viewport, { mouseButtons: 'right' })`, "The
- * right button pans, for a mouse alone"), and IsoCON puts rotate on the right drag and pan on
- * the middle, swapped by its `PanWithRight` preference. Neither makes navigation a tool. So the
- * RIGHT button PANS in every tool — the hand anyone arriving from the 2D map already has — and
- * rotating, which a flat map has no gesture for, goes on the PRESSED WHEEL. Shift+right rotates,
- * for a trackpad with no middle button. The left button always belongs to the active tool.
+ * drag plugin ONCE on the viewport (`new MouseDrag(viewport, { mouseButtons: 'right' })`, with the
+ * comment "The right button pans, for a mouse alone"), and IsoCON puts rotate on the right drag
+ * and pan on the middle, swapped by its `PanWithRight` preference. Neither makes navigation a
+ * tool. So here the RIGHT button PANS in every tool — the hand anyone arriving from the 2D map
+ * already has — and rotating, which a flat map has no gesture for, is the one new thing to learn:
+ * the PRESSED WHEEL. Shift+right rotates, for a trackpad with no middle button. The left button
+ * always belongs to the active tool.
  *
- * THERE IS NO ORBIT BUTTON. `Move` is the merged select-and-move tool — Atlas' own id — and the
- * neutral one: click selects, drag moves, a clean click on empty ground deselects. The hints
- * below say so; they used to describe the old per-tool mapping and a separate Orbit tool.
+ * `Orbit` is now redundant with `Move` — same camera, same click-to-select — and differs only in
+ * that Move also drags tokens. Merging them removes it from the `Tool` union, which touches
+ * ToolController, Interaction, Toolbar, Scene3D and SceneRenderer; that is its own step.
  *
  * The measure bar speaks Atlas' six modes, where `ruler` (a path with corners) and `line` (a
  * rectangle L×W) are DIFFERENT things. The legacy four-name bar is kept only as a fallback for a
- * scene that has not wired `onMeasureMode`. Controls whose handler is absent are not drawn.
+ * scene that has not wired `onMeasureMode`, because in that vocabulary 'line' meant the ruler.
+ * Controls whose handler is absent are not drawn: a button that does nothing is worse than none.
  */
 export interface ToolbarHandlers {
   onTool(tool: Tool): void;
@@ -66,12 +68,11 @@ const CAMERA_HINT = 'Right drag pans (as on the 2D map), press the wheel and dra
 
 const TOOLS: ReadonlyArray<{ tool: Tool; label: string; hint: string }> = [
   {
-    tool: 'move',
-    label: 'Move',
-    hint: 'Click a token to select, drag it to move (snapped to the grid, written back to Atlas), '
-      + 'click empty ground to deselect, right click a token for its menu, Ctrl+hover for its '
-      + 'statblock, double click centers. ' + CAMERA_HINT
-      + ' [ / ] or Alt+Q/E turn 90°, Home/Alt+H centers.',
+    tool: 'orbit',
+    label: 'Orbit',
+    hint: 'Click a token to select, right click for its menu, Ctrl+hover for its statblock. '
+      + CAMERA_HINT
+      + ' [ / ] or Alt+Q/E turn 90°, Home/Alt+H or double click centers.',
   },
   {
     tool: 'raise',
@@ -88,6 +89,12 @@ const TOOLS: ReadonlyArray<{ tool: Tool; label: string; hint: string }> = [
     label: 'Build',
     hint: 'Click to add, rotate or remove single blocks. Hold Alt to remove, Alt+R to turn the '
       + 'piece (Alt+Shift+R the other way). ' + CAMERA_HINT,
+  },
+  {
+    tool: 'move',
+    label: 'Move',
+    hint: 'Drag a token; it snaps to the grid and is written back to Atlas. Double click centers '
+      + 'the camera. ' + CAMERA_HINT,
   },
   {
     tool: 'measure',
@@ -111,9 +118,11 @@ const LEGACY_MEASURE_SHAPES: ReadonlyArray<{ shape: AoEShape; label: string; hin
   { shape: 'cube', label: 'Cube', hint: '3D cube AoE & terrain projection' },
 ];
 
-/** The six real Atlas modes, shown once the scene wires onMeasureMode. Hints follow Atlas' own
- *  semantics: a circle is a plan circle, a square is a box from the middle of its near side, a
- *  line is a rectangle as long as the drag and its width wide, ranges are labelled rings. */
+/**
+ * The six real Atlas modes, shown once the scene wires onMeasureMode. Hints follow Atlas' own
+ * semantics: a circle is a plan circle, a square is a box from the middle of its near side, a
+ * line is a rectangle as long as the drag and its width wide, ranges are labelled rings.
+ */
 const ATLAS_MEASURE_MODES: ReadonlyArray<{ mode: AtlasMeasureMode; label: string; hint: string }> = [
   { mode: 'ruler', label: 'Ruler', hint: 'Measure a path. Shift+Click adds a corner; the climb folds into the diagonal rule once.' },
   { mode: 'circle', label: 'Circle', hint: 'A circle on the plan, as far as the drag, projected onto every surface it covers.' },
@@ -244,7 +253,7 @@ export class Toolbar {
     this.measureClearButton = button(this.measureBar, 'Clear', 'Remove every kept measurement of the level shown (Atlas\'s own Clear)', () => handlers.onMeasureClear());
 
     this.status = root.createDiv({ cls: 'atlas3d-status' });
-    this.setTool('move');
+    this.setTool('orbit');
     this.setBrush(1);
     this.setSlice(null, 0);
     this.setMeasureState({ shape: 'line', keep: false }, 0);

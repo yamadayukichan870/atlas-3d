@@ -52,10 +52,6 @@ import { TextureLoader } from './textures';
  *                         so a diagonal counts whole cells however the art is nudged.
  *   - `rules()`         : the collection's rules as Atlas resolves them, cached per snapshot.
  *
- * ONE NEUTRAL TOOL: `move`, Atlas' own id. It selects, drags and deselects; the camera belongs to
- * the view and keeps the same buttons in every tool. Atlas' own toolbar drives it by store —
- * pressing Move or Measure there selects the same tool here — so there is no Orbit to keep in step.
- *
  * TWO HANDLES, both Atlas' own, wired here:
  *
  *   the badge on a token's rim  -> `binding.openMeasurePopover(id)`, Atlas' store action, so the
@@ -584,10 +580,13 @@ export class Scene3D extends Component {
     if (!(cells > 0)) return;
     const unit = this.rules().unitDistance;
     const distance = unit > 0 ? unit : 1;
-    const direction = change.direction ?? directionOf(measure.points);
+    const asked = change.direction;
+    const span = asked ? Math.hypot(asked.x, asked.z) : 0;
+    const direction = asked && Number.isFinite(span) && span > 1e-6
+      ? { x: asked.x / span, z: asked.z / span }
+      : directionOf(measure.points);
     const isAura = typeof measure.follows === 'string' && measure.follows !== ''
       && typeof measure.aura === 'number' && measure.aura > 0;
-
     if (isAura) {
       const token = this.tokensById.get(measure.follows as string);
       if (!token) return;
@@ -603,7 +602,6 @@ export class Scene3D extends Component {
       this.binding.updateMeasure(measure.id, { aura, points });
       return;
     }
-
     const origin = measure.points[0];
     if (!origin) return;
     const lengthPx = cells * grid.size;
@@ -637,17 +635,14 @@ export class Scene3D extends Component {
     if (sceneChanged || snapshot.background !== this.background) void this.loadMap(snapshot.background, sceneChanged);
     const editable = this.canEdit();
     this.toolbar.setCanEdit(editable);
-    if (!editable && this.tool !== 'move' && this.tool !== 'measure' && this.tool !== 'los') {
-      this.setTool('move');
+    if (!editable && this.tool !== 'orbit' && this.tool !== 'measure' && this.tool !== 'los') {
+      this.setTool('orbit');
     }
     // Sync the active tool with Atlas's own, once per change so our own writes do not loop.
-    // Atlas' `move` IS our merged select-and-move tool, so its own toolbar drives this one too;
-    // a tool of Atlas we do not mirror (wall, fog, …) only takes us out of Measure, into Move.
     if (snapshot.activeTool !== this.lastAtlasTool) {
       this.lastAtlasTool = snapshot.activeTool;
       if (snapshot.activeTool === 'measure' && this.tool !== 'measure') this.setTool('measure');
-      else if (snapshot.activeTool === 'move' && this.tool !== 'move') this.setTool('move');
-      else if (this.tool === 'measure' && snapshot.activeTool !== null && snapshot.activeTool !== 'measure') this.setTool('move');
+      else if (this.tool === 'measure' && snapshot.activeTool !== null && snapshot.activeTool !== 'measure') this.setTool('orbit');
     }
     if (snapshot.measureMode !== null && snapshot.measureMode !== this.lastAtlasMode) {
       this.lastAtlasMode = snapshot.measureMode;

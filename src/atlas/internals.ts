@@ -1,13 +1,5 @@
 import type { WorkspaceLeaf } from 'obsidian';
 
-/**
- * Every way this plugin reaches into Atlas VTT beyond what Atlas publishes, and nowhere else.
- * Besides `atlasStore`, everything here probes private/internal members of Atlas (`serviceManager`,
- * `renderer.getTokenRenderer()`, etc.). Each probe degrades gracefully to "not available" instead of
- * throwing, and is reported by `inspect` in the Diagnostics modal.
- */
-
-/** A field of an object by name, unchecked; undefined for anything that has none or whose getter throws. */
 export function field(target: unknown, name: string): unknown {
   try {
     return (typeof target === 'object' || typeof target === 'function') && target !== null && name in target
@@ -18,7 +10,6 @@ export function field(target: unknown, name: string): unknown {
   }
 }
 
-/** Calls a method of an unknown object, or returns undefined when it is missing or throws. */
 export function call(target: unknown, name: string, ...args: unknown[]): unknown {
   const fn = field(target, name);
   if (typeof fn !== 'function') return undefined;
@@ -29,7 +20,6 @@ export function call(target: unknown, name: string, ...args: unknown[]): unknown
   }
 }
 
-/** A plain record, or null for anything that is not one. Arrays are not records here. */
 function recordOf(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -38,80 +28,49 @@ function recordOf(value: unknown): Record<string, unknown> | null {
 
 const viewOf = (leaf: WorkspaceLeaf | null): unknown => (leaf === null ? undefined : field(leaf, 'view'));
 
-/** The element Atlas builds its view in (its canvas, then its interface above it), or null. */
 export function viewContainer(leaf: WorkspaceLeaf | null): HTMLElement | null {
   const el = field(viewOf(leaf), 'containerEl');
-  // Not `instanceof HTMLElement`: that is false for an element of another window (a popout).
   return typeof el === 'object' && el !== null && field(el, 'nodeType') === 1 ? (el as HTMLElement) : null;
 }
 
-/** Atlas's token renderer: `view.renderer.getTokenRenderer()`. */
 function tokenRendererOf(leaf: WorkspaceLeaf | null): unknown {
   return call(field(viewOf(leaf), 'renderer'), 'getTokenRenderer') ?? null;
 }
 
-/**
- * Atlas's asset service for this view. `ServiceManager.getAssetService()` is the public accessor;
- * the private `assetService` field is the fallback (TypeScript `private` is compile-time only, so it
- * is readable at runtime). Null when the asset manager feature is off or the service is unreachable.
- */
-function assetServiceOf(leaf: WorkspaceLeaf | null): unknown {
-  const manager = field(viewOf(leaf), 'serviceManager');
-  return call(manager, 'getAssetService') ?? field(manager, 'assetService') ?? null;
-}
-
-/** The store of the view, by its public getter or the `atlasStore` field. */
-function storeOf(leaf: WorkspaceLeaf | null): unknown {
-  const view = viewOf(leaf);
-  const direct = field(view, 'atlasStore');
-  if (direct !== undefined) return direct;
-  return call(view, 'getStore') ?? null;
-}
-
-/**
- * The collection a map belongs to, resolved the way Atlas resolves its rules: from the map's path
- * (`AssetService.getCollectionForMap`), NOT from `state.currentCollectionId`. That field is a UI
- * convenience initialised to 'default' and never persisted; Atlas's own `rulesForMap` ignores it.
- * Null when the map lies outside every collection, or the service cannot be reached.
- */
-export function mapCollectionIdOf(leaf: WorkspaceLeaf | null): string | null {
-  const service = assetServiceOf(leaf);
-  const state = call(storeOf(leaf), 'getState');
-  if (!service || !state) return null;
-  const mapPath = field(state, 'mapPath');
-  if (typeof mapPath !== 'string' || mapPath === '') return null;
-  const id = call(service, 'getCollectionForMap', mapPath);
-  return typeof id === 'string' && id !== '' ? id : null;
-}
-
-/**
- * The scene's collection settings object, read from the collection Atlas measures the map by.
- *
- * Null when the map belongs to no collection: Atlas measures such a map by its own grid state,
- * not by a collection called "Default". Resolving by `mapPath` (as `rulesForMap` does) is what
- * fixes reading the stale `currentCollectionId` ('default') instead of the map's real collection.
- *
- * Note: a campaign's played system wins over the collection in Atlas (`rulesForMap`); that override
- * is not probed here yet. A returned object may legitimately hold no `gridDefaults`/`movement`
- * (the collection then takes its game-system preset's or the built-in defaults).
- */
 export function readCollectionSettings(leaf: WorkspaceLeaf | null): unknown {
-  const service = assetServiceOf(leaf);
-  if (!service) return null;
-  const id = mapCollectionIdOf(leaf);
-  if (id === null) return null;
-  return call(service, 'getCollectionSettings', id) ?? null;
+  const view = viewOf(leaf);
+  const assetService = call(field(view, 'serviceManager'), 'getAssetService');
+  const store = field(view, 'atlasStore');
+  const state = call(store, 'getState');
+  if (!assetService || !state) return null;
+  const colIdField = field(state, 'currentCollectionId');
+  const mapPath = field(state, 'mapPath');
+  const colId = typeof colIdField === 'string' && colIdField !== ''
+    ? colIdField
+    : (typeof mapPath === 'string' ? call(assetService, 'getCollectionForMap', mapPath) : null);
+  if (typeof colId !== 'string' || colId === '') return null;
+  return call(assetService, 'getCollectionSettings', colId) ?? null;
 }
 
-/** The resource definitions of the scene's collection, exactly as Atlas hands them over (unvalidated). */
+export function mapCollectionIdOf(leaf: WorkspaceLeaf | null): string | null {
+  const view = viewOf(leaf);
+  const store = field(view, 'atlasStore');
+  const state = call(store, 'getState');
+  if (!state) return null;
+  const colIdField = field(state, 'currentCollectionId');
+  const mapPath = field(state, 'mapPath');
+  if (typeof colIdField === 'string' && colIdField !== '') return colIdField;
+  if (typeof mapPath !== 'string') return null;
+  const assetService = call(field(view, 'serviceManager'), 'getAssetService');
+  if (!assetService) return null;
+  const found = call(assetService, 'getCollectionForMap', mapPath);
+  return typeof found === 'string' && found !== '' ? found : null;
+}
+
 export function readResourceDefs(leaf: WorkspaceLeaf | null): unknown {
   return call(tokenRendererOf(leaf), 'resourceDefsProvider');
 }
 
-/**
- * The condition definitions of the scene's collection, probed across known Atlas layouts (0.12 - 0.16+).
- * Returns raw items or null when Atlas does not expose them.
- */
 export function readConditionDefs(leaf: WorkspaceLeaf | null): unknown {
   const tokenRenderer = tokenRendererOf(leaf);
   const controller = field(tokenRenderer, 'interactionController');
@@ -125,10 +84,6 @@ export function readConditionDefs(leaf: WorkspaceLeaf | null): unknown {
   return null;
 }
 
-/**
- * Opens Atlas's own right-click menu for a token at a screen position. It lives in the token interaction
- * controller, which only needs `clientX` and `clientY` from the event. False when it cannot be reached.
- */
 export function showTokenMenu(leaf: WorkspaceLeaf | null, token: unknown, clientX: number, clientY: number): boolean {
   const controller = field(tokenRendererOf(leaf), 'interactionController');
   const show = field(controller, 'showContextMenu');
@@ -142,7 +97,6 @@ export function showTokenMenu(leaf: WorkspaceLeaf | null, token: unknown, client
   }
 }
 
-/** Opens Atlas's native Edit Token modal for a token when reachable. */
 export function openTokenEditModal(leaf: WorkspaceLeaf | null, token: unknown): boolean {
   const controller = field(tokenRendererOf(leaf), 'interactionController');
   const show = field(controller, 'showEditTokenModal');
@@ -156,9 +110,6 @@ export function openTokenEditModal(leaf: WorkspaceLeaf | null, token: unknown): 
   }
 }
 
-// ---- the statblock window ---------------------------------------------------------------------
-
-/** What the view's event bus carries. */
 interface Emitter { emit(event: string, ...args: unknown[]): unknown }
 
 function busOf(leaf: WorkspaceLeaf | null): Emitter | null {
@@ -166,7 +117,6 @@ function busOf(leaf: WorkspaceLeaf | null): Emitter | null {
   return typeof field(bus, 'emit') === 'function' ? (bus as Emitter) : null;
 }
 
-/** The fields of a token that Atlas's own hover builds its preview from. */
 export interface PinnableToken {
   id: string;
   kind: string;
@@ -180,7 +130,6 @@ export interface PinnableToken {
   showRing?: boolean;
 }
 
-/** What Atlas's preview windows call a hovered element. */
 export interface PreviewPin {
   id: string;
   notePath: string;
@@ -194,10 +143,6 @@ export interface PreviewPin {
   showRing?: boolean;
 }
 
-/**
- * The hover pin of a token, built as Atlas builds it when the pointer is over a token on its own map: only a
- * character with a statblock note gets one, and the vitals travel with it so the window can mirror them.
- */
 export function previewPinFor(token: PinnableToken): PreviewPin | null {
   if (token.kind !== 'character' || !token.statblockPath?.trim()) return null;
   return {
@@ -214,11 +159,6 @@ export function previewPinFor(token: PinnableToken): PreviewPin | null {
   };
 }
 
-/**
- * Tells Atlas the pointer is over a token, as its own map does. Atlas then does the rest: it opens its
- * statblock window while Ctrl/Cmd is held (also if it is pressed after pointing), with its pin button, dice
- * rolls and the vitals, and rolls for the right scene.
- */
 export function showStatblockPreview(
   leaf: WorkspaceLeaf | null,
   pin: PreviewPin,
@@ -237,7 +177,6 @@ export function showStatblockPreview(
   }
 }
 
-/** Tells Atlas the pointer left the token. Atlas keeps the window while Ctrl is still held, or while it is pinned. */
 export function hideStatblockPreview(leaf: WorkspaceLeaf | null, pin: PreviewPin): boolean {
   const bus = busOf(leaf);
   if (bus === null) return false;
@@ -250,33 +189,21 @@ export function hideStatblockPreview(leaf: WorkspaceLeaf | null, pin: PreviewPin
   }
 }
 
-// ---- what is available ------------------------------------------------------------------------
-
 export interface Capability {
   id: string;
-  /** What works when this hook is there. */
   feature: string;
   ok: boolean;
-  /** What happens instead when it is not. */
   without: string;
-  /** Optional context (e.g. which collection was resolved), shown after the feature in the report. */
-  detail?: string;
 }
 
 const isFn = (target: unknown, name: string): boolean => typeof field(target, name) === 'function';
 
-/**
- * The parts of Atlas's own chrome the embedded 3D map measures to keep its toolbar clear of them.
- * They are class names, not an API: a release that renames them moves the toolbar over Atlas's
- * buttons in silence, so `inspect` reports whether they are still there.
- */
 export const ATLAS_CHROME_SELECTORS: readonly string[] = [
   '.atlas-top-bar-start',
   '.atlas-top-bar-end',
   '.atlas-level-switcher',
 ];
 
-/** Whether Atlas's view still holds the chrome the embedded toolbar makes room for. */
 function chromePresent(leaf: WorkspaceLeaf | null): boolean {
   const container = viewContainer(leaf);
   if (container === null) return false;
@@ -287,10 +214,6 @@ function chromePresent(leaf: WorkspaceLeaf | null): boolean {
   }
 }
 
-/**
- * Which of the hooks this plugin uses are present in this Atlas tab. For the diagnostic command: after an
- * Atlas update it says which feature stopped working, instead of it failing silently.
- */
 export function inspect(leaf: WorkspaceLeaf | null): Capability[] {
   const view = viewOf(leaf);
   const store = field(view, 'atlasStore');
@@ -299,27 +222,14 @@ export function inspect(leaf: WorkspaceLeaf | null): Capability[] {
   const condDefs = readConditionDefs(leaf);
   const controller = field(tokenRendererOf(leaf), 'interactionController');
   const canMove = isFn(state, 'setTokenPositions') || isFn(state, 'dropTokens') || isFn(state, 'updateToken');
-
   const objects = recordOf(field(state, 'objects'));
-  // A scene with nothing measured yet may hold no `measures` record at all; the action's presence
-  // is what says this Atlas has the kept-measurement model.
-  const hasMeasures = recordOf(field(objects, 'measures')) !== null || isFn(state, 'addMeasure');
-
-  // The collection is resolved by mapPath, as Atlas's own rulesForMap does. `serviceOk` says the
-  // probe itself works; `collectionId` says which collection (null = the map is outside them all).
-  const service = assetServiceOf(leaf);
-  const serviceOk = service !== null && isFn(service, 'getCollectionForMap') && isFn(service, 'getCollectionSettings');
-  const collectionId = serviceOk ? mapCollectionIdOf(leaf) : null;
+  const hasMeasures = recordOf(field(objects, 'measures')) !== null || isFn(state, 'addMeasure') || isFn(state, 'addObject');
   const collection = recordOf(readCollectionSettings(leaf));
   const gridDefaults = recordOf(field(collection, 'gridDefaults'));
   const movement = recordOf(field(collection, 'movement'));
-
-  const collectionDetail = !serviceOk
-    ? 'asset service not reachable'
-    : collectionId !== null
-      ? `collection "${collectionId}"`
-      : 'map belongs to no collection (measures by its grid)';
-
+  // Atlas 0.21.2+: patchObject + removeObjects; 0.16.0-0.20.x: updateMeasure + deleteMeasure
+  const canEditMeasure = isFn(state, 'patchObject') || isFn(state, 'updateMeasure');
+  const canDeleteMeasure = isFn(state, 'removeObjects') || isFn(state, 'deleteMeasure');
   return [
     {
       id: 'store',
@@ -390,19 +300,19 @@ export function inspect(leaf: WorkspaceLeaf | null): Capability[] {
     {
       id: 'measureKeep',
       feature: 'Keeping a measurement from 3D, saved by Atlas',
-      ok: isFn(state, 'addMeasure'),
+      ok: isFn(state, 'addMeasure') || isFn(state, 'addObject'),
       without: 'Keep only pins the measurement inside the 3D map; Atlas does not save it',
     },
     {
       id: 'measureEdit',
       feature: 'Moving or editing a kept measurement',
-      ok: isFn(state, 'updateMeasure'),
+      ok: canEditMeasure,
       without: 'a kept measurement cannot be changed, only removed and drawn again',
     },
     {
       id: 'measureDelete',
       feature: 'Removing one measurement (the × on its pill)',
-      ok: isFn(state, 'deleteMeasure'),
+      ok: canDeleteMeasure,
       without: 'the × cannot remove a measurement Atlas holds',
     },
     {
@@ -418,35 +328,28 @@ export function inspect(leaf: WorkspaceLeaf | null): Capability[] {
       without: 'choosing a mode in 3D does not move the Atlas toolbar',
     },
     {
+      id: 'measurePopover',
+      feature: 'Atlas\'s own measurement options popover',
+      ok: isFn(state, 'openMeasurePopover') && isFn(state, 'closeMeasurePopover'),
+      without: 'the 3D badge cannot open Atlas\'s popover; a fallback panel would have to be drawn',
+    },
+    {
       id: 'auras',
       feature: 'Setting a token aura from 3D',
       ok: isFn(state, 'setTokenAuras'),
       without: 'auras can be read but not changed from the 3D map',
     },
     {
-      id: 'collection',
-      feature: 'Finding the collection a map belongs to (the source of its rules)',
-      ok: serviceOk,
-      without: 'the 3D map cannot read collection rules and measures by the map grid alone',
-      detail: collectionDetail,
-    },
-    {
       id: 'collectionRules',
       feature: 'The collection measurement rules (diagonals, units, cone, bands)',
       ok: gridDefaults !== null,
-      without: 'the collection stores no grid defaults; both views measure by the map grid and built-in defaults',
-      ...(gridDefaults === null && serviceOk && collectionId !== null
-        ? { detail: 'no stored gridDefaults; Atlas uses defaults / the game-system preset' }
-        : {}),
+      without: 'the 3D map measures by the map grid alone, which may differ from Atlas',
     },
     {
       id: 'movementRules',
       feature: 'Movement steps and per-turn counting',
       ok: movement !== null,
       without: 'a move is not coloured by step, and movement is not counted per turn',
-      ...(movement === null && serviceOk && collectionId !== null
-        ? { detail: 'no stored movement; Atlas uses the game-system preset' }
-        : {}),
     },
     {
       id: 'chrome',
@@ -457,12 +360,10 @@ export function inspect(leaf: WorkspaceLeaf | null): Capability[] {
   ];
 }
 
-/** The report as plain text, for the diagnostic window and to paste into a bug report. */
 export function formatReport(atlasVersion: string | null, capabilities: readonly Capability[]): string {
   const lines = [`Atlas VTT ${atlasVersion ?? '(version unknown)'}`, ''];
   for (const c of capabilities) {
-    const suffix = c.detail !== undefined ? `  (${c.detail})` : '';
-    lines.push(c.ok ? `[ok] ${c.feature}${suffix}` : `[MISSING] ${c.feature} - without it: ${c.without}${suffix}`);
+    lines.push(c.ok ? `[ok] ${c.feature}` : `[MISSING] ${c.feature} - without it: ${c.without}`);
   }
   const present = capabilities.filter((c) => c.ok).length;
   lines.push('', `${present} of ${capabilities.length} hooks available`);

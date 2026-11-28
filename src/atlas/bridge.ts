@@ -47,28 +47,6 @@ import {
   type SceneSnapshot,
 } from './types';
 
-/**
- * The one place that reads and writes an Atlas map tab's store.
- *
- * Measurement rules are not re-implemented here: they are resolved by `measureRules.ts`, which
- * was verified against atlas-vtt/atlas-vtt @ tag 0.16.0 (`grid/measurementFormat.ts`,
- * `measure/movementRules.ts`, `measure/measureTypes.ts`, `stores/measuresSlice.ts`). This file
- * only hands it what Atlas stored and passes the answer on.
- *
- * Four things it used to say differently from Atlas, all corrected here:
- *   - a movement step's factor is `multiple`, not `multiplier`;
- *   - `countPerTurn` is on only when stored as true, not by default;
- *   - a cone's end defaults to `round`, not `flat`;
- *   - a map outside a collection measures in range bands unless its grid says 'units'.
- *
- * Atlas' own interface is reused wherever it has one, rather than rebuilt: its right-click token
- * menu, its token editor, its statblock window, and — added here — its measurement options
- * popover. `stores/uiSlice.ts` carries `openMeasurePopover(measureId)` and `closeMeasurePopover()`
- * as store actions, the same door `setMeasureTool` goes through, so the panel a GM gets from the
- * 3D map is Atlas' own, with its colours, its effects and its toggles, and it stays in step with
- * every Atlas release without a line of ours.
- */
-
 function recordOf(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -79,7 +57,6 @@ function isStore(value: unknown): value is AtlasSceneStore {
   return typeof field(value, 'getState') === 'function' && typeof field(value, 'subscribe') === 'function';
 }
 
-/** The Atlas plugin instance Obsidian keeps by id, or undefined when it is not loaded. */
 export function atlasPlugin(app: App): unknown {
   return field(field(field(app, 'plugins'), 'plugins'), ATLAS_PLUGIN_ID);
 }
@@ -89,10 +66,6 @@ export function atlasVersion(app: App): string | null {
   return typeof version === 'string' ? version : null;
 }
 
-/**
- * The store of an Atlas map tab, or null for any other leaf. Deferred (not yet loaded) leaves
- * have the right view type but no `atlasStore`, so they read as null until Obsidian loads them.
- */
 export function sceneStoreOf(leaf: WorkspaceLeaf): AtlasSceneStore | null {
   if (leaf.view.getViewType() !== ATLAS_VIEW_TYPE) return null;
   const view = leaf.view as unknown;
@@ -104,7 +77,6 @@ export function atlasLeaves(app: App): WorkspaceLeaf[] {
   return app.workspace.getLeavesOfType(ATLAS_VIEW_TYPE).filter((leaf) => sceneStoreOf(leaf) !== null);
 }
 
-/** Keeps following `current` while it exists, else the most recent Atlas tab, else the first. */
 export function pickAtlasLeaf(app: App, current: WorkspaceLeaf | null): WorkspaceLeaf | null {
   const leaves = atlasLeaves(app);
   if (current && leaves.includes(current)) return current;
@@ -117,18 +89,10 @@ function tokensOnLevel(state: AtlasSceneState, shownId: string | undefined, firs
   const all = Object.values(state.objects?.tokens ?? {});
   return all.filter((token) => {
     if (!token || token.offMap) return false;
-    // Atlas: an object without a level stands on the first one.
     return shownId === undefined || (token.level ?? firstId) === shownId;
   });
 }
 
-/**
- * The kept measurements of the level shown, auras included.
- *
- * An aura's `points` are where it lay when it was last edited and are never rewritten when its
- * token moves, so an aura is kept whatever its points hold: its geometry comes from `aura` and
- * the token's own space. A drawn measurement needs two points to be anything.
- */
 function measuresOnLevel(state: AtlasSceneState, shownId: string | undefined, firstId: string | undefined): AtlasMeasure[] {
   const all = Object.values(state.objects?.measures ?? {});
   const out: AtlasMeasure[] = [];
@@ -160,14 +124,12 @@ function readMeasureTool(state: AtlasSceneState): AtlasMeasureToolState {
   return state.measureTool ?? state.measure ?? {};
 }
 
-/** The width the next line takes, in cells, as Atlas's tool holds it (1-20). */
 function readLineWidth(tool: AtlasMeasureToolState): number | null {
   const raw = tool.lineWidth;
   if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return null;
   return Math.min(MAX_LINE_WIDTH_CELLS, raw);
 }
 
-/** Narrows Atlas's state to what the 3D view draws: the level being shown, its tokens, measures, grid and view mode. */
 export function snapshotOf(state: AtlasSceneState): SceneSnapshot {
   const levels = Array.isArray(state.levels) ? state.levels : [];
   const first = levels[0];
@@ -178,17 +140,14 @@ export function snapshotOf(state: AtlasSceneState): SceneSnapshot {
   const activeTool = typeof state.activeTool === 'string'
     ? state.activeTool
     : (typeof state.tool === 'string' ? state.tool : null);
-
   const mt = readMeasureTool(state);
   const measureMode = normalizeMeasureMode(mt.mode ?? mt.shape ?? state.measureMode ?? state.measureShape);
   const measureKeep = typeof mt.keep === 'boolean'
     ? mt.keep
     : (typeof mt.persist === 'boolean' ? mt.persist : (typeof state.measureKeep === 'boolean' ? state.measureKeep : null));
-
   return {
     mapPath: state.mapPath ?? null,
     ready: state.mapLoaded === true && state.isMapLoading !== true,
-    // Atlas: the first level's background is the scene's own `background`.
     background: isBase ? (state.background ?? null) : (shown?.background ?? null),
     grid: state.grid ?? null,
     tokens: tokensOnLevel(state, shownId, first?.id),
@@ -208,7 +167,6 @@ export function snapshotOf(state: AtlasSceneState): SceneSnapshot {
   };
 }
 
-/** Parts of the state whose identity decides whether the 3D view must update (Immer keeps references). */
 function watched(state: AtlasSceneState): unknown[] {
   return [
     state.mapPath, state.mapLoaded, state.isMapLoading, state.background, state.grid,
@@ -239,12 +197,6 @@ function parseConditionDefs(raw: unknown): AtlasConditionDef[] | null {
   return out.length > 0 ? out : null;
 }
 
-/**
- * The rules the scene measures and moves by, resolved as Atlas resolves them: the collection's
- * grid defaults with the scene's own unit overrides, or the scene's grid when the map belongs to
- * no collection. `source` says which of the two answered, so a caller can tell "the collection
- * stores no defaults" from "there is no collection".
- */
 function rulesOf(leaf: WorkspaceLeaf | null, grid: AtlasGrid | null): AtlasSceneRules {
   const collection = recordOf(readCollectionSettings(leaf));
   const defaults = recordOf(field(collection, 'gridDefaults'));
@@ -255,7 +207,6 @@ function rulesOf(leaf: WorkspaceLeaf | null, grid: AtlasGrid | null): AtlasScene
   };
 }
 
-/** A line's width in world pixels, which is what Atlas persists; cells are the tool's unit. */
 function lineWidthPx(widthCells: number | undefined, gridSize: number | undefined): number | null {
   if (typeof gridSize !== 'number' || !(gridSize > 0) || !Number.isFinite(gridSize)) return null;
   const cells = typeof widthCells === 'number' && Number.isFinite(widthCells) && widthCells > 0
@@ -264,42 +215,21 @@ function lineWidthPx(widthCells: number | undefined, gridSize: number | undefine
   return cells * gridSize;
 }
 
-/** What a measurement is created from. Points are world pixels, as Atlas stores them. */
 export interface MeasurePayload {
-  /** One of the five shapes Atlas persists; `ranges` is a tool mode and is never stored. */
   shape: AtlasMeasureShape;
   points: readonly AtlasPoint[];
-  /** A line's width in CELLS; stored as `width` in world pixels. */
   widthCells?: number;
-  /** `#rrggbb`; null or absent is the theme's accent, which Atlas stores as no colour at all. */
   color?: string | null;
-  /** The tool's toggle. False means only the GM sees it, which Atlas stores as `hidden: true`. */
   players?: boolean;
-  /** Only the GM sees it, said directly. Either this or `players: false` hides it. */
   hidden?: boolean;
   effect?: string | null;
-  /** False for an area walls do not stop; absent stops at walls, as every area does. */
   walls?: boolean;
-  /** The token this circle follows: an aura. Needs `aura`, and points are then only a snapshot. */
   follows?: string;
-  /** How far an aura reaches from the edge of its token's space, in game units. */
   aura?: number;
-  /** The level it stands on; absent is the level shown. */
   level?: string;
   origin?: AtlasMeasureOrigin;
 }
 
-/**
- * The part of Atlas's state its own measurement popover reads. Verified against
- * `pixi/measure/measurePopoverGuard.ts` @ tag 0.16.0: `mayEditMeasure` wants the measurement on
- * the level shown and the GM's view of a loaded scene, and `closeStaleMeasurePopover` closes a
- * popover that no longer passes that test on EVERY store change.
- *
- * Every field is optional here, as every probed field in this plugin is: an Atlas that does not
- * name one is read as not forbidding it, which is the same tolerance `snapshotOf` already applies
- * to `isGMView`. These two fields belong in `AtlasSceneActions`/`AtlasSceneState` alongside the
- * other actions; they are probed here so this file compiles without a second file changing.
- */
 interface PopoverEditState {
   readonly measurePopover?: unknown;
   readonly isGMView?: boolean;
@@ -307,14 +237,11 @@ interface PopoverEditState {
   readonly isMapLoading?: boolean;
 }
 
-/** Follows one Atlas tab's store and reports a snapshot whenever something the 3D view draws changed. */
 export class AtlasBinding {
   private store: AtlasSceneStore | null = null;
   private leaf: WorkspaceLeaf | null = null;
-  /** The pin Atlas was last told about, so it can be told it is gone. */
   private hovered: PreviewPin | null = null;
   private unsubscribe: (() => void) | null = null;
-  /** Atlas's own signal that a collection's settings were saved; the store does not carry them. */
   private rulesRef: EventRef | null = null;
   private last: unknown[] = [];
 
@@ -332,8 +259,6 @@ export class AtlasBinding {
     this.leaf = leaf;
     this.last = [];
     this.unsubscribe = store.subscribe((state) => this.consider(state));
-    // Collection rules are read from the asset service, not from the store, so editing them
-    // changes nothing the store watches. Atlas announces the save on the workspace.
     try {
       this.rulesRef = leaf.view.app.workspace.on('atlas-vtt:collection-settings-changed', (collectionId: unknown) => {
         this.onCollectionSettingsChanged(collectionId);
@@ -361,7 +286,6 @@ export class AtlasBinding {
     this.leaf = null;
   }
 
-  /** Selects tokens in Atlas itself, so its own interface reacts. False when this Atlas has no such action. */
   select(ids: readonly string[]): boolean {
     const state = this.store?.getState();
     if (state === undefined) return false;
@@ -375,10 +299,6 @@ export class AtlasBinding {
     return true;
   }
 
-  /**
-   * One step of a token's resource, through Atlas's own `updateToken`, so Atlas saves it and records the
-   * undo step. A resource the token does not have is left alone. False when nothing could be written.
-   */
   stepResource(tokenId: string, key: string, delta: number): boolean {
     const state = this.store?.getState();
     const token = state?.objects?.tokens?.[tokenId];
@@ -390,7 +310,6 @@ export class AtlasBinding {
     return true;
   }
 
-  /** Writes a token's rotation (degrees) into Atlas. */
   setTokenRotation(tokenId: string, rotation: number): boolean {
     const state = this.store?.getState();
     if (state === undefined || typeof state.updateToken !== 'function') return false;
@@ -398,7 +317,6 @@ export class AtlasBinding {
     return true;
   }
 
-  /** Writes a token's elevation (in game units) into Atlas. */
   setTokenElevation(tokenId: string, elevation: number): boolean {
     const state = this.store?.getState();
     if (state === undefined || typeof state.updateToken !== 'function') return false;
@@ -406,7 +324,6 @@ export class AtlasBinding {
     return true;
   }
 
-  /** Writes a token's grid size into Atlas (1 = 1x1, 1.5 = 2x2, 2 = 3x3). */
   setTokenSize(tokenId: string, size: number): boolean {
     const state = this.store?.getState();
     if (state === undefined || typeof state.updateToken !== 'function') return false;
@@ -414,7 +331,6 @@ export class AtlasBinding {
     return true;
   }
 
-  /** Toggles a condition on a token through Atlas's action or token update fallback. */
   toggleCondition(tokenId: string, conditionId: string): boolean {
     const state = this.store?.getState();
     const token = state?.objects?.tokens?.[tokenId];
@@ -433,26 +349,16 @@ export class AtlasBinding {
     return false;
   }
 
-  /** The rules this scene measures and moves by, as Atlas resolves them. Always answers. */
   sceneRules(): AtlasSceneRules {
     return rulesOf(this.leaf, this.store?.getState().grid ?? null);
   }
 
-  /**
-   * How far a token moves: its own speed where it states one, else the collection's for creatures
-   * that state none. Null where neither says, and such a token moves without steps.
-   */
   tokenSpeed(tokenId: string): number | null {
     const token = this.store?.getState().objects?.tokens?.[tokenId];
     return movementSpeedFor(token?.speed, this.sceneRules().movement);
   }
 
-  /**
-   * The collection's measurement settings in the loose shape earlier callers read.
-   *
-   * @deprecated Read `sceneRules()` instead: it carries the resolved settings and the movement
-   * rules as Atlas holds them. This projection goes away with its last consumer.
-   */
+  /** @deprecated Use `sceneRules()` instead. */
   collectionMeasureSettings(): AtlasCollectionMeasureSettings {
     const rules = this.sceneRules();
     const s = rules.measurement;
@@ -479,21 +385,15 @@ export class AtlasBinding {
   }
 
   /**
-   * Keeps a measurement in Atlas, so 2D and 3D show the same thing and Atlas saves it. Returns the
-   * id Atlas gave it, or null when nothing was kept — which is also what Atlas answers when the
-   * level already holds its 256.
-   *
-   * Only fields Atlas reads are sent. `players` is translated to `hidden`, a line's width from
-   * cells to world pixels, and the accent colour is sent as no colour at all: a field Atlas does
-   * not know would be stored and never read.
+   * Keeps a measurement in Atlas. Returns the id Atlas gave it, or null when nothing was kept.
+   * Compatible with both 0.16.0 (addMeasure) and 0.21.2+ (addObject).
    */
   addMeasure(payload: MeasurePayload): string | null {
     const state = this.store?.getState();
-    if (state === undefined || typeof state.addMeasure !== 'function') return null;
+    if (state === undefined) return null;
     if (!ATLAS_MEASURE_SHAPES.includes(payload.shape)) return null;
     const follows = typeof payload.follows === 'string' && payload.follows !== '' ? payload.follows : null;
     if (follows !== null && (typeof payload.aura !== 'number' || !(payload.aura > 0))) return null;
-
     const points: AtlasPoint[] = [];
     for (const point of payload.points) {
       if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) continue;
@@ -501,11 +401,9 @@ export class AtlasBinding {
       if (points.length >= MAX_RULER_POINTS) break;
     }
     if (points.length < 2 && follows === null) return null;
-
     const levels = Array.isArray(state.levels) ? state.levels : [];
     const level = payload.level ?? (levels.length > 0 ? (state.viewedLevel ?? levels[0]?.id) : undefined);
     const width = payload.shape === 'line' ? lineWidthPx(payload.widthCells, state.grid?.size) : null;
-
     const data: Record<string, unknown> = { shape: payload.shape, points };
     if (typeof level === 'string' && level !== '') data.level = level;
     if (typeof payload.color === 'string' && payload.color.trim() !== '') data.color = payload.color;
@@ -525,8 +423,17 @@ export class AtlasBinding {
       };
     }
     try {
-      const id = state.addMeasure(data);
-      return typeof id === 'string' && id !== '' ? id : null;
+      // Atlas 0.21.2+: addObject
+      if (typeof (state as any).addObject === 'function') {
+        const id = (state as any).addObject('measures', data);
+        return typeof id === 'string' && id !== '' ? id : null;
+      }
+      // Atlas 0.16.0-0.20.x: addMeasure
+      if (typeof state.addMeasure === 'function') {
+        const id = state.addMeasure(data);
+        return typeof id === 'string' && id !== '' ? id : null;
+      }
+      return null;
     } catch (error) {
       console.error('[Atlas 3D] Atlas could not keep the measurement', error);
       return null;
@@ -534,32 +441,56 @@ export class AtlasBinding {
   }
 
   /**
-   * Changes a kept measurement. A field given as undefined is removed from it, which is how a
-   * measurement goes back to the theme's accent (`color: undefined`) or loses its effect.
+   * Changes a kept measurement. Compatible with both 0.16.0 (updateMeasure) and 0.21.2+ (patchObject).
    */
   updateMeasure(id: string, changes: AtlasMeasureChanges): boolean {
     const state = this.store?.getState();
-    if (state === undefined || typeof state.updateMeasure !== 'function') return false;
+    if (state === undefined) return false;
     if (!state.objects?.measures?.[id]) return false;
     const record: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(changes)) record[key] = value;
     try {
-      state.updateMeasure(id, record);
-      return true;
+      // Atlas 0.21.2+: patchObject
+      if (typeof (state as any).patchObject === 'function') {
+        (state as any).patchObject('measures', id, record);
+        return true;
+      }
+      // Atlas 0.16.0-0.20.x: updateMeasure
+      if (typeof state.updateMeasure === 'function') {
+        state.updateMeasure(id, record);
+        return true;
+      }
+      return false;
     } catch (error) {
       console.error('[Atlas 3D] Atlas could not change the measurement', error);
       return false;
     }
   }
 
+  /**
+   * Removes a kept measurement. Compatible with both 0.16.0 (deleteMeasure) and 0.21.2+ (removeObjects).
+   */
   deleteMeasure(id: string): boolean {
     const state = this.store?.getState();
-    if (state === undefined || typeof state.deleteMeasure !== 'function') return false;
-    state.deleteMeasure(id);
-    return true;
+    if (state === undefined) return false;
+    try {
+      // Atlas 0.21.2+: removeObjects
+      if (typeof (state as any).removeObjects === 'function') {
+        (state as any).removeObjects([id]);
+        return true;
+      }
+      // Atlas 0.16.0-0.20.x: deleteMeasure
+      if (typeof state.deleteMeasure === 'function') {
+        state.deleteMeasure(id);
+        return true;
+      }
+      return false;
+    } catch (error) {
+      console.error('[Atlas 3D] Atlas could not remove the measurement', error);
+      return false;
+    }
   }
 
-  /** Removes every kept measurement of the level SHOWN. Other levels keep theirs. */
   clearMeasures(): boolean {
     const state = this.store?.getState();
     if (state === undefined || typeof state.clearMeasures !== 'function') return false;
@@ -567,11 +498,6 @@ export class AtlasBinding {
     return true;
   }
 
-  /**
-   * Gives tokens their auras in one undo step: a reach of 0 takes the aura away, a token that has
-   * none gets one on its own level. Points are where the aura lies now; Atlas does not rewrite
-   * them when the token moves, so the 3D geometry must come from the reach and the token's space.
-   */
   setTokenAuras(auras: readonly AtlasTokenAura[], look?: { color?: string | null; hidden?: boolean }): boolean {
     const state = this.store?.getState();
     if (state === undefined || typeof state.setTokenAuras !== 'function') return false;
@@ -603,36 +529,6 @@ export class AtlasBinding {
     return true;
   }
 
-  // ---- Atlas's own measurement popover --------------------------------------------------------
-
-  /**
-   * Opens Atlas's OWN options popover for a kept measurement — its colours, its effects, its light,
-   * its audience, its walls and its Delete. Nothing of ours is drawn: the panel is Atlas', so it
-   * looks like the rest of Atlas and keeps up with its releases by itself.
-   *
-   * Verified against `stores/uiSlice.ts` @ tag 0.16.0:
-   *   openMeasurePopover: (measureId) => set((draft) => {
-   *     draft.measurePopover = measureId;
-   *     draft.lightPopover = null;
-   *     draft.lightZonePopover = null;
-   *   })
-   * so it is an ordinary store action, the same door `setMeasureTool` goes through, and it closes
-   * an open light popover as Atlas' own badge does.
-   *
-   * Three things are checked before asking, because Atlas would undo the ask otherwise:
-   *   - the measurement is on the level shown (`mayEditMeasure` in `measurePopoverGuard.ts`);
-   *   - the view is the GM's of a loaded scene, not the Player View — a popover opened there is
-   *     closed again by `closeStaleMeasurePopover` on the very next store change;
-   *   - the action exists at all.
-   *
-   * The answer is read back from `measurePopover` rather than assumed: the action returns void, so
-   * the field is the only evidence it took. False means "no panel of Atlas is open for this", and
-   * the caller may say so instead of leaving a button that appears to do nothing.
-   *
-   * Where the panel appears is Atlas's choice, not ours: it anchors it to the measurement's handle
-   * in ITS OWN view. Inside an Atlas tab (the embedded 3D map) that is the same window. In the
-   * separate 3D pane it is the Atlas tab, which may be behind this one.
-   */
   openMeasurePopover(id: string): boolean {
     const store = this.store;
     if (store === null || typeof id !== 'string' || id === '') return false;
@@ -640,10 +536,8 @@ export class AtlasBinding {
     const open = field(state, 'openMeasurePopover');
     if (typeof open !== 'function') return false;
     if (!state.objects?.measures?.[id]) return false;
-
     const view = state as PopoverEditState;
     if (view.isGMView === false || view.isPlayerView === true || view.isMapLoading === true) return false;
-
     try {
       (open as (measureId: string) => void).call(state, id);
     } catch (error) {
@@ -653,11 +547,6 @@ export class AtlasBinding {
     return (store.getState() as PopoverEditState).measurePopover === id;
   }
 
-  /**
-   * Closes Atlas's measurement popover, if one is open. False when this Atlas has no such action
-   * or nothing was open — closing nothing is not a write, and a store write here would be a
-   * needless notify on every gesture that ends.
-   */
   closeMeasurePopover(): boolean {
     const store = this.store;
     if (store === null) return false;
@@ -675,39 +564,29 @@ export class AtlasBinding {
     }
   }
 
-  /** The measurement whose options popover Atlas currently has open, or null. */
   measurePopoverId(): string | null {
     const open = (this.store?.getState() as PopoverEditState | undefined)?.measurePopover;
     return typeof open === 'string' && open !== '' ? open : null;
   }
 
-  /** Opens Atlas's own right-click menu for a token at a screen position. False when Atlas will not. */
   openContextMenu(tokenId: string, clientX: number, clientY: number): boolean {
     const token = this.store?.getState().objects?.tokens?.[tokenId];
     return token ? showTokenMenu(this.leaf, token, clientX, clientY) : false;
   }
 
-  /** Opens Atlas's native Edit Token modal when reachable. */
   openEditModal(tokenId: string): boolean {
     const token = this.store?.getState().objects?.tokens?.[tokenId];
     return token ? openTokenEditModal(this.leaf, token) : false;
   }
 
-  /** The resources of the scene's collection as Atlas defines them, or null when it will not say. */
   resourceDefs(): AtlasResourceDef[] | null {
     return parseDefs(readResourceDefs(this.leaf));
   }
 
-  /** The condition definitions of the scene's collection, or null when Atlas will not say. */
   conditionDefs(): AtlasConditionDef[] | null {
     return parseConditionDefs(readConditionDefs(this.leaf));
   }
 
-  /**
-   * Tells Atlas the pointer is over a token, so Atlas shows its own statblock window (with Ctrl held, as on its
-   * own map). Only a character with a statblock note has one. `sourceLeaf` is the Atlas tab the pointer is in,
-   * which decides the window it opens in. False when there is nothing to show or Atlas cannot be reached.
-   */
   showStatblock(tokenId: string, clientX: number, clientY: number, sourceLeaf: WorkspaceLeaf | null): boolean {
     const token = this.store?.getState().objects?.tokens?.[tokenId];
     const pin = token ? previewPinFor(token) : null;
@@ -716,17 +595,12 @@ export class AtlasBinding {
     return true;
   }
 
-  /** Tells Atlas the pointer left the token it was over, if there was one. */
   hideStatblock(): void {
     const pin = this.hovered;
     this.hovered = null;
     if (pin) hideStatblockPreview(this.leaf, pin);
   }
 
-  /**
-   * Moves tokens through Atlas's own store action (`setTokenPositions`, `dropTokens`, or `updateToken`),
-   * wrapped in a temporal undo transaction when available.
-   */
   moveTokens(positions: Array<{ id: string; x: number; y: number }>): boolean {
     const state = this.store?.getState();
     if (state === undefined) return false;
@@ -751,7 +625,6 @@ export class AtlasBinding {
     }
   }
 
-  /** A collection's rules were saved: report again, but only when they are this map's own. */
   private onCollectionSettingsChanged(collectionId: unknown): void {
     const store = this.store;
     if (store === null) return;

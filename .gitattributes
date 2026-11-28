@@ -1,2 +1,9 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Generated files — excluded from code-health and language stats.
+# main.js is the esbuild bundle (~40K lines of three.js + plugin code);
+# without these, Repowise's health score is dominated by churn in a file
+# we never edit by hand and cannot delete (BRAT and releases need it).
+/main.js linguist-generated=true
+/main.js.map linguist-generated=true

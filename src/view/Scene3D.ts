@@ -69,6 +69,11 @@ import { TextureLoader } from './textures';
  * an area's FOOTPRINT from one its VOLUME actually reaches — a flier 15ft up is in a ground cube's
  * footprint but out of its effect, and only the lift can say so.
  *
+ * `move` IS THE NEUTRAL TOOL. `orbit` is gone from the `Tool` union: it selected but did not drag,
+ * and it had no handler behind it, so falling back to it — on leaving Measure, or on a map with no
+ * editable grid — left the left button dead. Both fallbacks below now name `move`, which selects,
+ * drags, and is always reachable. Atlas' own Move button drives it too, through the store.
+ *
  * Selection is a set, not a single id: the Select (N) button of a measured area selects every token
  * inside it, in Atlas itself. The first of the set is what the camera and the HUD follow.
  *
@@ -635,14 +640,17 @@ export class Scene3D extends Component {
     if (sceneChanged || snapshot.background !== this.background) void this.loadMap(snapshot.background, sceneChanged);
     const editable = this.canEdit();
     this.toolbar.setCanEdit(editable);
-    if (!editable && this.tool !== 'orbit' && this.tool !== 'measure' && this.tool !== 'los') {
-      this.setTool('orbit');
+    // `move` is the neutral tool: it selects and looks even where terrain cannot be edited.
+    if (!editable && this.tool !== 'move' && this.tool !== 'measure' && this.tool !== 'los') {
+      this.setTool('move');
     }
     // Sync the active tool with Atlas's own, once per change so our own writes do not loop.
+    // Atlas' `move` IS our merged select-and-move tool, so its own toolbar drives this one too.
     if (snapshot.activeTool !== this.lastAtlasTool) {
       this.lastAtlasTool = snapshot.activeTool;
       if (snapshot.activeTool === 'measure' && this.tool !== 'measure') this.setTool('measure');
-      else if (this.tool === 'measure' && snapshot.activeTool !== null && snapshot.activeTool !== 'measure') this.setTool('orbit');
+      else if (snapshot.activeTool === 'move' && this.tool !== 'move') this.setTool('move');
+      else if (this.tool === 'measure' && snapshot.activeTool !== null && snapshot.activeTool !== 'measure') this.setTool('move');
     }
     if (snapshot.measureMode !== null && snapshot.measureMode !== this.lastAtlasMode) {
       this.lastAtlasMode = snapshot.measureMode;

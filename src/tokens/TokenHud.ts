@@ -1,6 +1,7 @@
 import type { HudValue } from '../atlas/resources';
 import type { FacingAngle } from '../terrain/blocks';
 import { WIDGET_ICON_PATHS, WIDGET_ICON_VIEW_BOX, resolveWidgetIconKey } from './WidgetIcons';
+import { resizedTokenSize, tokenDiameterInCells } from './tokenSizes';
 
 export interface HudCondition {
   id: string;
@@ -52,11 +53,17 @@ const RING_R = 15.5;
 const RING_LENGTH = 2 * Math.PI * RING_R;
 const REFERENCE_CELL = 70;
 const MAX_VISIBLE_CONDITIONS = 5;
-const ATLAS_SIZES = [1, 1.5, 2, 2.5] as const;
 const DEG = Math.PI / 180;
 
 const clamp01 = (n: number): number => Math.min(1, Math.max(0, n));
 const ratio = (v: HudValue): number => (v.max > 0 ? clamp01(v.current / v.max) : 0);
+
+/** How a footprint reads in a handle's hint: the CELLS it covers, not the stored multiplier. */
+function footprintText(size: number): string {
+  const d = tokenDiameterInCells(size);
+  const n = Number.isInteger(d) ? String(d) : d.toFixed(2).replace(/0$/, '');
+  return `${n}×${n}`;
+}
 
 function appendIconSvg(parent: HTMLElement, rawIcon: string, cls: string): void {
   if (rawIcon === 'eye-off') {
@@ -94,20 +101,6 @@ export function isPointCoveredByCloserToken(
     if (dx * dx + dy * dy <= r * r) return true;
   }
   return false;
-}
-
-function nextAtlasSize(current: number, dir: -1 | 1): number {
-  let closestIdx = 0;
-  let bestDist = Infinity;
-  for (let i = 0; i < ATLAS_SIZES.length; i++) {
-    const d = Math.abs(ATLAS_SIZES[i]! - current);
-    if (d < bestDist) {
-      bestDist = d;
-      closestIdx = i;
-    }
-  }
-  const nextIdx = Math.min(ATLAS_SIZES.length - 1, Math.max(0, closestIdx + dir));
-  return ATLAS_SIZES[nextIdx]!;
 }
 
 function facingForScreenDir(dir: 'up' | 'right' | 'down' | 'left', cameraAzimuthDeg: number): FacingAngle {
@@ -149,7 +142,16 @@ interface Entry {
 /**
  * Floating 2D HUD overlay for tokens: Atlas-faithful segmented wheels (`#1a1a1a` / `#888` / `#111114`),
  * pill bars with 10% ticks, radial condition arc (`-85°` to `-175°`), 2D occlusion,
- * single-selection handles (rotate, flip, Atlas size) and 4-way FFT/Wakfu facing cross.
+ * single-selection handles (rotate, flip, size) and 4-way FFT/Wakfu facing cross.
+ *
+ * THE SIZE ARROWS WALK ATLAS' LADDER, not integers. This file used to keep its own
+ * `[1, 1.5, 2, 2.5]` and step through it, so a Medium token could never shrink: the rung below 1
+ * did not exist, `next` equalled `current`, the handler wrote nothing, and the down button was
+ * disabled by `atlasSize <= 1` besides. Atlas' own `resizedTokenSize` has eleven rungs —
+ * 0.75 (Tiny, a quarter cell), 0.875 (Small), 1, 1.5, 2, 2.5, 3 … 5 — and it steps from the NEAREST
+ * rung, so a token whose stored size is off-ladder still moves. The ladder now lives in
+ * `tokens/tokenSizes.ts`, ported from Atlas, and the buttons disable only when a step would not
+ * change anything.
  */
 export class TokenHud {
   private readonly layer: HTMLElement;
@@ -317,8 +319,21 @@ export class TokenHud {
     // Update live handle states when 1 token is selected
     if (showHandles) {
       if (entry.flipBtn) entry.flipBtn.toggleClass('is-active', token.flipX);
-      if (entry.sizeDownBtn) entry.sizeDownBtn.disabled = token.atlasSize <= ATLAS_SIZES[0];
-      if (entry.sizeUpBtn) entry.sizeUpBtn.disabled = token.atlasSize >= ATLAS_SIZES[ATLAS_SIZES.length - 1]!;
+      // A rung is spent when stepping from it lands on itself — Atlas' ladder ends at 0.75 and 5.
+      const smaller = resizedTokenSize(token.atlasSize, -1);
+      const larger = resizedTokenSize(token.atlasSize, 1);
+      if (entry.sizeDownBtn) {
+        entry.sizeDownBtn.disabled = smaller === token.atlasSize;
+        entry.sizeDownBtn.title = smaller === token.atlasSize
+          ? 'Smallest footprint'
+          : `Smaller footprint (${footprintText(smaller)})`;
+      }
+      if (entry.sizeUpBtn) {
+        entry.sizeUpBtn.disabled = larger === token.atlasSize;
+        entry.sizeUpBtn.title = larger === token.atlasSize
+          ? 'Largest footprint'
+          : `Larger footprint (${footprintText(larger)})`;
+      }
       for (const [dir, btn] of entry.facingBtns) {
         const targetFacing = facingForScreenDir(dir, cameraAzimuthDeg);
         btn.toggleClass('is-active', token.facing === targetFacing);
@@ -417,13 +432,13 @@ export class TokenHud {
       const sizeDownBtn = entry.handlesEl.createEl('button', {
         cls: 'atlas3d-handle-btn atlas3d-size-btn is-left',
         text: '‹',
-        attr: { title: 'Decrease token size', 'aria-label': 'Decrease token size' },
+        attr: { title: 'Smaller footprint', 'aria-label': 'Decrease token size' },
       });
       sizeDownBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
       sizeDownBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         const cur = entry.latestToken?.atlasSize ?? 1;
-        const next = nextAtlasSize(cur, -1);
+        const next = resizedTokenSize(cur, -1);
         if (next !== cur) this.handlers.onResizeToken(token.id, next);
       });
       entry.sizeDownBtn = sizeDownBtn;
@@ -431,13 +446,13 @@ export class TokenHud {
       const sizeUpBtn = entry.handlesEl.createEl('button', {
         cls: 'atlas3d-handle-btn atlas3d-size-btn is-right',
         text: '›',
-        attr: { title: 'Increase token size', 'aria-label': 'Increase token size' },
+        attr: { title: 'Larger footprint', 'aria-label': 'Increase token size' },
       });
       sizeUpBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
       sizeUpBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         const cur = entry.latestToken?.atlasSize ?? 1;
-        const next = nextAtlasSize(cur, 1);
+        const next = resizedTokenSize(cur, 1);
         if (next !== cur) this.handlers.onResizeToken(token.id, next);
       });
       entry.sizeUpBtn = sizeUpBtn;

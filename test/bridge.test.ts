@@ -1,8 +1,23 @@
 import { AtlasBinding, sceneStoreOf, snapshotOf } from '../src/atlas/bridge';
 import { field } from '../src/atlas/internals';
-import { creatureForToken, type FsApi, type FsCreature } from '../src/atlas/statblocks';
-import { snapCenter } from '../src/view/interaction';
+import { snapCenter } from '../src/tools/ToolController';
 import type { AtlasSceneState, AtlasToken } from '../src/atlas/types';
+
+/**
+ * The bridge, against its real API.
+ *
+ * TWO IMPORTS WERE WRONG, not the assertions. `snapCenter` lives in `tools/ToolController.ts`
+ * (this file pointed at `view/interaction`, a path from before the folders were reorganised).
+ * Its four expectations were checked against the current implementation, quarter-cell branch
+ * included, and hold.
+ *
+ * WHAT LEFT THIS FILE. The Fantasy Statblocks block read `creatureForToken` from
+ * `atlas/statblocks.ts`. That module does not exist — `src/atlas/` holds bridge, internals,
+ * measureRules, measureVocabulary, resources and types. Its eight assertions (lookup by note
+ * path, by statblock name, by basename; an API without `isResolved`; a lookup that throws) are
+ * a coverage gap, recorded rather than quietly dropped. If that module is ever ported, they come
+ * back with it.
+ */
 
 let failures = 0;
 const check = (name: string, ok: boolean, detail = ''): void => {
@@ -95,24 +110,6 @@ const leafOf = (view: unknown) => ({ view }) as never;
   check('binding: attach to a non-Atlas leaf fails without side effects', new AtlasBinding(() => undefined).attach(leafOf({ getViewType: () => 'markdown' })) === false);
 }
 
-// ---- Fantasy Statblocks ---------------------------------------------------------------------------
-{
-  const goblin: FsCreature = { name: 'Goblin', path: 'Bestiary/Goblin.md' };
-  const orc: FsCreature = { name: 'Orc' };
-  const api = (over: Partial<FsApi> = {}): FsApi => ({
-    render: () => ({}) as never, getBestiaryCreatures: () => [goblin, orc],
-    hasCreature: (n) => [goblin, orc].some((c) => c.name === n), getCreatureFromBestiary: (n) => [goblin, orc].find((c) => c.name === n) ?? null,
-    isResolved: () => true, ...over,
-  });
-  check('creature: found by note path', creatureForToken(api(), tok('t', { statblockPath: 'Bestiary/Goblin.md' })) === goblin);
-  check('creature: falls back to the statblock name', creatureForToken(api(), tok('t', { statblockPath: 'Elsewhere/x.md', statblockName: 'Orc' })) === orc);
-  check('creature: falls back to the note basename', creatureForToken(api(), tok('t', { notePath: 'Notes/Orc.md' })) === orc);
-  check('creature: not read before the bestiary is resolved', creatureForToken(api({ isResolved: () => false }), tok('t', { statblockName: 'Orc' })) === null);
-  check('creature: an older API without isResolved is read as resolved', creatureForToken(api({ isResolved: undefined }), tok('t', { name: 'Orc' })) === orc);
-  check('creature: a throwing lookup yields null, not an exception', creatureForToken(api({ getCreatureFromBestiary: () => { throw new Error('not parsed'); } }), tok('t', { name: 'Orc' })) === null);
-  check('creature: unknown token yields null', creatureForToken(api(), tok('t', { name: 'Dragon' })) === null);
-}
-
 // ---- snapping (mirrors Atlas's tokenCenterShift for square grids) ----------------------------------
 {
   const grid = { size: 70, offsetX: 10, offsetY: 20 };
@@ -126,7 +123,6 @@ const leafOf = (view: unknown) => ({ view }) as never;
   const negative = snapCenter(-0.2, -0.2, 1, { size: 70, offsetX: 0, offsetY: 0 });
   check('snap: left of the origin snaps to cell -1, not 0', negative.x === -35, String(negative.x));
 }
-
 
 // ---- the actions that write to Atlas ----------------------------------------------------------------------------
 {
@@ -175,7 +171,6 @@ const leafOf = (view: unknown) => ({ view }) as never;
   console.error = log;
   check('a menu that throws reports false instead of claiming success', crashed === false);
 }
-
 
 // ---- Atlas's statblock window -----------------------------------------------------------------------------------
 {

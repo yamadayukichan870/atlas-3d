@@ -21,6 +21,13 @@ export interface MoveTargetSpec {
   floorCeiling: number;
 }
 
+/** One selected token's logical footprint, in world units over the plan. */
+export interface SelectionFrameSpec {
+  x: number;
+  z: number;
+  diameter: number;
+}
+
 function createSquareBorderGeometry(): THREE.BufferGeometry {
   const h = 0.48;
   const positions = new Float32Array([
@@ -36,16 +43,29 @@ function createSquareBorderGeometry(): THREE.BufferGeometry {
 
 /**
  * Translucent brush cursor (Raise/Lower), block placement ghost (Build),
- * and FFT-style landing tile highlight while dragging tokens.
+ * FFT-style landing tile highlight while dragging tokens, and the ground frame
+ * a selected token's footprint wears.
+ *
+ * THE SELECTION FRAME IS THE FOOTPRINT, not the art. TokenLayer already draws a yellow ring
+ * around a selected token's billboard; this draws the cells it OCCUPIES on the floor, which is
+ * what Atlas' 2D map shows and what tells a 3x3's reach from a 1x1's at a glance. It reuses the
+ * landing tile's square border, pooled so a hundred selected tokens are a hundred LineSegments
+ * sharing one geometry and one material, never a rebuild.
  */
 export class ToolOverlays {
   readonly cursor: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
   readonly ghost: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>;
   readonly moveTileGroup = new THREE.Group();
+  readonly selectionGroup = new THREE.Group();
   private readonly moveFill: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
   private readonly moveBorder: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial>;
   private readonly moveFreeRing: THREE.Mesh<THREE.RingGeometry, THREE.MeshBasicMaterial>;
   private readonly ghostGeometries = new Map<string, THREE.BufferGeometry>();
+  private readonly selectionBorderGeometry = createSquareBorderGeometry();
+  private readonly selectionMaterial = new THREE.LineBasicMaterial({
+    color: 0xffd24a, transparent: true, opacity: 0.85, depthTest: false,
+  });
+  private readonly selectionFrames: THREE.LineSegments[] = [];
 
   constructor() {
     this.cursor = new THREE.Mesh(
@@ -82,10 +102,11 @@ export class ToolOverlays {
 
     this.moveTileGroup.add(this.moveFill, this.moveBorder, this.moveFreeRing);
     this.moveTileGroup.visible = false;
+    this.selectionGroup.visible = false;
   }
 
   addTo(scene: THREE.Scene): void {
-    scene.add(this.cursor, this.ghost, this.moveTileGroup);
+    scene.add(this.cursor, this.ghost, this.moveTileGroup, this.selectionGroup);
   }
 
   setCursor(
@@ -156,6 +177,47 @@ export class ToolOverlays {
     return true;
   }
 
+  /**
+   * The ground frame under each selected token's footprint. Called every frame with the current
+   * selection, so it follows terrain edits and the slice without a separate invalidation path.
+   * The pool grows to the most tokens ever selected at once and never shrinks; extra frames hide.
+   */
+  setSelection(
+    frames: readonly SelectionFrameSpec[],
+    layout: Layout | null,
+    map: BlockMap,
+    ceilingY: number,
+  ): boolean {
+    if (!layout || frames.length === 0) {
+      const had = this.selectionGroup.visible;
+      this.selectionGroup.visible = false;
+      return had;
+    }
+    for (let i = 0; i < frames.length; i++) {
+      let line = this.selectionFrames[i];
+      if (!line) {
+        line = new THREE.LineSegments(this.selectionBorderGeometry, this.selectionMaterial);
+        line.renderOrder = 3;
+        this.selectionFrames.push(line);
+        this.selectionGroup.add(line);
+      }
+      const f = frames[i]!;
+      const gx = f.x - layout.originX;
+      const gz = f.z - layout.originZ;
+      const radius = f.diameter <= 1 ? 0.35 : Math.max(0.2, f.diameter * 0.44);
+      const ground = map.sampleDisc(gx, gz, radius, ceilingY).max;
+      const scale = Math.max(1, f.diameter);
+      line.position.set(f.x, ground + 0.02, f.z);
+      line.scale.set(scale, 1, scale);
+      line.visible = true;
+    }
+    for (let i = frames.length; i < this.selectionFrames.length; i++) {
+      this.selectionFrames[i]!.visible = false;
+    }
+    this.selectionGroup.visible = true;
+    return true;
+  }
+
   dispose(): void {
     for (const g of this.ghostGeometries.values()) g.dispose();
     this.ghostGeometries.clear();
@@ -169,6 +231,9 @@ export class ToolOverlays {
     this.moveBorder.geometry.dispose();
     this.moveFreeRing.material.dispose();
     this.moveFreeRing.geometry.dispose();
+    // Every selection frame shares these two; dispose once, not per frame.
+    this.selectionMaterial.dispose();
+    this.selectionBorderGeometry.dispose();
   }
 
   private ghostGeometry(shape: BlockShape, rot: Rotation): THREE.BufferGeometry {

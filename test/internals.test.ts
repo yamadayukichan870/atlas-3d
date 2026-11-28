@@ -77,25 +77,48 @@ const leafOf = (view: unknown) => ({ view }) as never;
 
 // ---- the diagnostic ------------------------------------------------------------------------------------------------------
 {
+  // A fake Atlas with EVERY hook the current inspect() probes, so "all present" can be true. The
+  // old fake was from the eight-hook era; inspect() now reports twenty-one. Several probes share a
+  // path (the token renderer carries the menu, the editor AND the condition defs; the container
+  // carries the chrome check), so a removal loses exactly the capabilities that read that path.
+  const collection = {
+    gridDefaults: { unitDistance: 5, diagonalRule: 'equidistant' },
+    movement: { steps: [], countPerTurn: false },
+    conditions: [{ id: 'prone', name: 'Prone' }],
+  };
+  const assetService = { getCollectionForMap: () => 'col', getCollectionSettings: () => collection };
+  const state = {
+    currentCollectionId: 'col',
+    objects: { measures: {} },
+    setTokenPositions() {}, updateToken() {}, setSelection() {}, clearSelection() {},
+    addMeasure() {}, updateMeasure() {}, deleteMeasure() {}, clearMeasures() {},
+    setMeasureTool() {}, setTokenAuras() {}, openMeasurePopover() {}, closeMeasurePopover() {},
+  };
   const store = Object.assign(() => state, { getState: () => state, subscribe: () => () => undefined });
-  const state = { setTokenPositions() {}, updateToken() {}, setSelection() {}, clearSelection() {} };
   const full = {
-    atlasStore: store, containerEl: { nodeType: 1 },
-    serviceManager: { eventBus: { emit() {} } },
-    renderer: { getTokenRenderer: () => ({ resourceDefsProvider: () => [{ key: 'hp' }], interactionController: { showContextMenu() {} } }) },
+    atlasStore: store,
+    containerEl: { nodeType: 1, querySelector: () => ({}) },
+    serviceManager: { eventBus: { emit() {} }, getAssetService: () => assetService },
+    renderer: { getTokenRenderer: () => ({
+      resourceDefsProvider: () => [{ key: 'hp' }],
+      interactionController: { showContextMenu() {}, showEditTokenModal() {}, getConditionDefs: () => [{ id: 'prone', name: 'Prone' }] },
+    }) },
   };
   const ok = (view: unknown): Record<string, boolean> => Object.fromEntries(inspect(leafOf(view)).map((c) => [c.id, c.ok]));
 
   const all = inspect(leafOf(full));
-  check('diagnostic: every hook is reported present when Atlas has them all', all.length === 8 && all.every((c) => c.ok), JSON.stringify(ok(full)));
+  check('diagnostic: every hook is reported present when Atlas has them all', all.length === 21 && all.every((c) => c.ok), JSON.stringify(ok(full)));
   check('diagnostic: each entry says what it gives and what happens without it', all.every((c) => c.feature.length > 5 && c.without.length > 5));
   check('diagnostic: ids are unique', new Set(all.map((c) => c.id)).size === all.length);
 
   /** Every capability except the ones named is present. */
   const onlyMissing = (r: Record<string, boolean>, ...missing: string[]): boolean =>
     Object.entries(r).every(([id, present]) => (missing.includes(id) ? !present : present));
-  check('diagnostic: no event bus loses only the statblock window', onlyMissing(ok({ ...full, serviceManager: {} }), 'statblock'));
-  check('diagnostic: no token renderer loses only the menu and the colours', onlyMissing(ok({ ...full, renderer: {} }), 'menu', 'defs'));
+  // Only the event bus goes; the asset service stays, so the collection rules still read.
+  check('diagnostic: no event bus loses only the statblock window', onlyMissing(ok({ ...full, serviceManager: { getAssetService: () => assetService } }), 'statblock'));
+  // The renderer carries the menu, the editor and the condition defs; the conditions fall back to
+  // the collection, so they survive — the menu, the colours and the editor do not.
+  check('diagnostic: no token renderer loses the menu, the colours and the editor', onlyMissing(ok({ ...full, renderer: {} }), 'menu', 'defs', 'editModal'));
   check('diagnostic: a store without updateToken loses only the + and - buttons', (() => {
     const noUpdate = Object.assign(() => 0, { getState: () => ({ ...state, updateToken: undefined }), subscribe: () => () => undefined });
     return onlyMissing(ok({ ...full, atlasStore: noUpdate }), 'resources');
@@ -104,7 +127,8 @@ const leafOf = (view: unknown) => ({ view }) as never;
     const noSelect = Object.assign(() => 0, { getState: () => ({ ...state, setSelection: undefined }), subscribe: () => () => undefined });
     return onlyMissing(ok({ ...full, atlasStore: noSelect }), 'selection');
   })());
-  check('diagnostic: no container loses only the embedded mode', onlyMissing(ok({ ...full, containerEl: null }), 'container'));
+  // The chrome check reads the container too, so losing it takes both.
+  check('diagnostic: no container loses the embedded mode and the chrome check', onlyMissing(ok({ ...full, containerEl: null }), 'container', 'chrome'));
   check('diagnostic: no resource definitions (an empty list) is reported, as they are then inferred', !ok({ ...full, renderer: { getTokenRenderer: () => ({ resourceDefsProvider: () => [], interactionController: { showContextMenu() {} } }) } }).defs);
   check('diagnostic: no Atlas tab at all reports everything missing without throwing', inspect(null).every((c) => !c.ok) && inspect(leafOf({})).every((c) => !c.ok));
 }
@@ -118,7 +142,7 @@ const leafOf = (view: unknown) => ({ view }) as never;
   const text = formatReport('0.12.1', caps);
   const lines = text.split('\n');
   check('report: starts with the Atlas version', lines[0] === 'Atlas VTT 0.12.1');
-  check('report: present hooks are marked ok, missing ones say what is lost', lines.includes('[ok]      Following the scene') && lines.includes('[MISSING] Atlas\'s right-click token menu - without it: a right click opens nothing'));
+  check('report: present hooks are marked ok, missing ones say what is lost', lines.includes('[ok] Following the scene') && lines.includes('[MISSING] Atlas\'s right-click token menu - without it: a right click opens nothing'));
   check('report: ends with the count', lines[lines.length - 1] === '1 of 2 hooks available');
   check('report: an unknown version is said so, and an empty list still reads', formatReport(null, []).startsWith('Atlas VTT (version unknown)') && formatReport(null, []).endsWith('0 of 0 hooks available'));
 }

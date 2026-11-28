@@ -1,7 +1,24 @@
 import { BlockMap, makeBlock } from '../src/terrain/blocks';
-import { buildChunk, chunkOf, chunkRange, chunksToBuild, hexToLinear, type BuildOptions, type ChunkBuffers } from '../src/terrain/blockGeometry';
+import { buildTerrainChunk, hexToLinear, type TerrainBuildOptions, type TerrainChunkBuffers } from '../src/terrain/blockGeometry';
+import { chunkOf, chunkRange, chunksToBuild } from '../src/terrain/flatSurface';
 import { computeLayout } from '../src/terrain/layout';
 import { BLOCK_SHAPES } from '../src/terrain/shapes';
+
+/**
+ * The terrain vertex builder, against its real API.
+ *
+ * RENAMED, NOT REWRITTEN. Every assertion below is the one this file always had; only the names
+ * changed: `buildChunk` is `buildTerrainChunk`, `BuildOptions` is `TerrainBuildOptions`,
+ * `ChunkBuffers` is `TerrainChunkBuffers`, and the chunk helpers (`chunkOf`, `chunkRange`,
+ * `chunksToBuild`) live in `terrain/flatSurface.ts`, which is where the builder imports them from.
+ *
+ * WHAT LEFT THIS FILE. The builder no longer draws grid lines — `gridLines` is not an option and
+ * `ChunkBuffers.lines` is not a field. Grid lines belong to `grid/GridLayer.ts` now, and that
+ * module has NO test: the eight assertions that used to live here (8 vertices per cell, an outline
+ * that follows a ramp, stairs outlined tread by tread) are a coverage gap, recorded rather than
+ * quietly dropped. What the builder emits instead is `edges`: deduplicated block outlines, pushed
+ * out along the averaged face normal so they never z-fight. The block at the end tests those.
+ */
 
 let failures = 0;
 const check = (name: string, ok: boolean, detail = ''): void => {
@@ -10,19 +27,19 @@ const check = (name: string, ok: boolean, detail = ''): void => {
 };
 
 const GRID = { size: 70, offsetX: 0, offsetY: 0 };
-const flat = (cols: number, rows: number, layerHeight = 1): { map: BlockMap; opts: BuildOptions } => {
+const flat = (cols: number, rows: number, layerHeight = 1): { map: BlockMap; opts: TerrainBuildOptions } => {
   const map = new BlockMap();
   map.layerHeight = layerHeight;
   map.surface = 'colors';
   map.extent = { cols, rows };
   const layout = computeLayout({ image: null, grid: GRID, extent: map.extent });
-  return { map, opts: { map, layout, useImage: false, gridLines: false, checker: false } };
+  return { map, opts: { map, layout, useImage: false, checker: false } };
 };
 /** Builds every chunk of a map and sums the vertex counts. */
-function total(opts: BuildOptions): { top: number; solid: number; liquid: number; lines: number; all: ChunkBuffers[] } {
-  const all = [...chunksToBuild(opts.map, opts.layout)].map((k) => { const [cx, cz] = k.split(',').map(Number); return buildChunk(opts, chunkRange(cx as number, cz as number)); });
-  const sum = (f: (c: ChunkBuffers) => number): number => all.reduce((s, c) => s + f(c), 0);
-  return { top: sum((c) => c.tops.positions.length / 3), solid: sum((c) => c.solid.positions.length / 3), liquid: sum((c) => c.liquid.positions.length / 3), lines: sum((c) => c.lines.length / 3), all };
+function total(opts: TerrainBuildOptions): { top: number; solid: number; liquid: number; edges: number; all: TerrainChunkBuffers[] } {
+  const all = [...chunksToBuild(opts.map, opts.layout)].map((k) => { const [cx, cz] = k.split(',').map(Number); return buildTerrainChunk(opts, chunkRange(cx as number, cz as number)); });
+  const sum = (f: (c: TerrainChunkBuffers) => number): number => all.reduce((s, c) => s + f(c), 0);
+  return { top: sum((c) => c.tops.positions.length / 3), solid: sum((c) => c.solid.positions.length / 3), liquid: sum((c) => c.liquid.positions.length / 3), edges: sum((c) => c.edges.length / 3), all };
 }
 const faces = (verts: number): number => verts / 6; // quads are 6 vertices; a slope's triangles would be 3
 
@@ -103,7 +120,7 @@ const faces = (verts: number): number => verts / 6; // quads are 6 vertices; a s
   const rnd = (): number => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
   for (let i = 0; i < 400; i++) map.place(makeBlock(Math.floor(rnd() * 40), 1 + Math.floor(rnd() * 3), Math.floor(rnd() * 8), BLOCK_SHAPES[Math.floor(rnd() * 5)]!, ([0, 90, 180, 270] as const)[Math.floor(rnd() * 4)]!));
   const chunked = total(opts);
-  const whole = buildChunk(opts, { cx0: -1, cx1: 41, cz0: -1, cz1: 9 });
+  const whole = buildTerrainChunk(opts, { cx0: -1, cx1: 41, cz0: -1, cz1: 9 });
   check('chunks: building in 16x16 pieces draws exactly what one big pass draws (solid)', chunked.solid === whole.solid.positions.length / 3, `${chunked.solid} vs ${whole.solid.positions.length / 3}`);
   check('chunks: ... and the same for water and the floor', chunked.liquid === whole.liquid.positions.length / 3 && chunked.top === whole.tops.positions.length / 3);
   check('chunks: 40 columns span 3 chunks along x', new Set([...chunksToBuild(map, opts.layout)].map((k) => k.split(',')[0])).size === 3);
@@ -117,7 +134,7 @@ const faces = (verts: number): number => verts / 6; // quads are 6 vertices; a s
   const { map, opts } = flat(2, 2);
   map.preset = { top: '#00ff00', side: '#0000ff' };
   map.place(makeBlock(0, 1, 0, 'Solid', 0, '#ff0000'));
-  const c = buildChunk(opts, chunkRange(0, 0)).solid;
+  const c = buildTerrainChunk(opts, chunkRange(0, 0)).solid;
   let topOK = false, sideOK = false;
   for (let v = 0; v < c.positions.length / 3; v++) {
     const up = c.normals[v * 3 + 1] === 1, rgb = [c.colors[v * 3], c.colors[v * 3 + 1], c.colors[v * 3 + 2]];
@@ -126,7 +143,7 @@ const faces = (verts: number): number => verts / 6; // quads are 6 vertices; a s
   }
   check('colour: a block uses its own top colour and the preset for what it has none of', topOK && sideOK);
   const dark = flat(2, 1); dark.opts.checker = true; dark.map.place(makeBlock(0, 1, 0)); dark.map.place(makeBlock(1, 1, 0));
-  const cc = buildChunk(dark.opts, chunkRange(0, 0)).solid;
+  const cc = buildTerrainChunk(dark.opts, chunkRange(0, 0)).solid;
   const shades = new Set<number>(); for (let v = 0; v < cc.colors.length; v += 3) if (cc.colors[v + 1]! > 0) shades.add(+cc.colors[v + 1]!.toFixed(4));
   check('colour: the checker shades neighbouring blocks differently', shades.size >= 2);
 }
@@ -135,7 +152,7 @@ const faces = (verts: number): number => verts / 6; // quads are 6 vertices; a s
 {
   const map = new BlockMap(); map.layerHeight = 0.5;
   const layout = computeLayout({ image: { widthPx: 280, heightPx: 210 }, grid: GRID, extent: null });
-  const opts: BuildOptions = { map, layout, useImage: true, gridLines: false, checker: false };
+  const opts: TerrainBuildOptions = { map, layout, useImage: true, checker: false };
   check('layout: an image of 280x210 at 70 px per cell is 4x3 cells', layout.bounds.x1 === 4 && layout.bounds.z1 === 3 && layout.range.cx1 === 3 && layout.range.cz1 === 2);
   let t = total(opts);
   check('image: the floor shows the map and has texture coordinates', t.top === 12 * 6 && t.solid === 0);
@@ -155,23 +172,11 @@ const faces = (verts: number): number => verts / 6; // quads are 6 vertices; a s
 
   const off = computeLayout({ image: { widthPx: 280, heightPx: 210 }, grid: { size: 70, offsetX: 21, offsetY: 49 }, extent: null });
   const m2 = new BlockMap();
-  const o2: BuildOptions = { map: m2, layout: off, useImage: true, gridLines: false, checker: false };
+  const o2: TerrainBuildOptions = { map: m2, layout: off, useImage: true, checker: false };
   const t2 = total(o2);
   let inside = true; for (const c of t2.all) for (let i = 0; i < c.tops.positions.length; i += 3) if (c.tops.positions[i]! < -1e-9 || c.tops.positions[i]! > 4 + 1e-9 || c.tops.positions[i + 2]! < -1e-9 || c.tops.positions[i + 2]! > 3 + 1e-9) inside = false;
   check('offset grid: cells cut by the image edge are clipped inside it', inside && off.range.cx0 === -1 && off.range.cz0 === -1, JSON.stringify(off.range));
 }
-
-// ---- grid lines -------------------------------------------------------------------------------------------
-{
-  const { map, opts } = flat(4, 4, 0.5);
-  opts.gridLines = true;
-  map.place(makeBlock(1, 1, 1)); map.place(makeBlock(1, 2, 1));
-  const t = total(opts);
-  check('lines: 8 vertices per cell inside the map', t.lines === 16 * 8);
-  const ys = t.all.flatMap((c) => { const out: number[] = []; for (let i = 1; i < c.lines.length; i += 3) out.push(c.lines[i]!); return out; });
-  check('lines: a column\'s outline sits on its top (2 layers x 0.5 = 1.0), the rest on the ground', ys.some((y) => Math.abs(y - 1.01) < 1e-6) && ys.some((y) => Math.abs(y - 0.01) < 1e-6));
-}
-
 
 // ---- water: it must hide what is behind it ---------------------------------------------------------------------------
 {
@@ -197,23 +202,26 @@ const faces = (verts: number): number => verts / 6; // quads are 6 vertices; a s
   check('water: an explicit side colour is still honoured', colours('#ff0000', '#00ff00').size === 2);
 }
 
-// ---- grid lines follow the real top faces -------------------------------------------------------------------------------
+// ---- block edges: what the builder outlines now ----------------------------------------------------------------------
 {
-  const yOf = (shape: 'Slope' | 'Steps' | 'Solid'): number[] => {
-    // A 1x1 map, so the only outline is the one under test (neighbours would share its edges).
-    const f = flat(1, 1); f.opts.gridLines = true; f.map.place(makeBlock(0, 1, 0, shape));
-    const out: number[] = []; for (const c of total(f.opts).all) for (let i = 1; i < c.lines.length; i += 3) out.push(+c.lines[i]!.toFixed(3));
-    return out;
-  };
-  const cube = yOf('Solid');
-  check('grid: a cube column is outlined flat at its top', new Set(cube).size === 1 && cube[0] === 1.01);
-  const ramp = new Set(yOf('Slope'));
-  check('grid: a ramp is outlined along its slope (low edge and high edge), not as a flat square', ramp.has(0.01) && ramp.has(1.01) && ramp.size === 2, JSON.stringify([...ramp]));
-  const stairs = new Set(yOf('Steps'));
-  check('grid: stairs are outlined tread by tread (half and full layer)', stairs.has(0.51) && stairs.has(1.01), JSON.stringify([...stairs]));
-  const f = flat(4, 4); f.opts.gridLines = true; f.map.place(makeBlock(1, 1, 1, 'Steps'));
-  const t = total(f.opts);
-  check('grid: a stair column has two outlines (2 treads x 4 edges x 2 vertices), the rest one per cell', t.lines === 15 * 8 + 16, String(t.lines));
+  // `edges` replaced `lines`: not a per-cell grid, but the block's own outline, deduplicated across
+  // faces and pushed out along the averaged normal. Only opaque blocks emit them.
+  const { map, opts } = flat(4, 4);
+  check('edges: an empty floor outlines nothing', total(opts).edges === 0);
+  map.place(makeBlock(1, 1, 1));
+  const one = total(opts);
+  check('edges: a cube is outlined', one.edges > 0, String(one.edges));
+  check('edges: two vertices of three floats per segment', one.edges % 2 === 0, String(one.edges));
+
+  const wet = flat(4, 4);
+  wet.map.place(makeBlock(1, 1, 1, 'Liquid'));
+  check('edges: water is never outlined', total(wet.opts).edges === 0);
+
+  // A shared edge is emitted once, not once per face: two cubes side by side have fewer than two
+  // separate outlines' worth of segments.
+  const pair = flat(4, 4);
+  pair.map.place(makeBlock(1, 1, 1)); pair.map.place(makeBlock(2, 1, 1));
+  check('edges: neighbours share their touching edge instead of drawing it twice', total(pair.opts).edges < one.edges * 2, `${total(pair.opts).edges} vs ${one.edges * 2}`);
 }
 
 // ---- lit normals must be the real geometry's normals at ANY layer height -----------------------------------------------

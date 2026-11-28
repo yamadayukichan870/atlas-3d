@@ -1,4 +1,4 @@
-import type { App, EventRef, WorkspaceLeaf } from 'obsidian';
+import type { App, EventRef, Events, WorkspaceLeaf } from 'obsidian';
 import {
   field,
   hideStatblockPreview,
@@ -260,7 +260,11 @@ export class AtlasBinding {
     this.last = [];
     this.unsubscribe = store.subscribe((state) => this.consider(state));
     try {
-      this.rulesRef = leaf.view.app.workspace.on('atlas-vtt:collection-settings-changed', (collectionId: unknown) => {
+      // A custom event is not in Workspace's overload set: those name only Obsidian's own.
+      // `Events` is the base it inherits, and its `on` takes any name — the door Atlas' own
+      // `workspace.trigger('atlas-vtt:…')` comes through. Cast to the base, not to `any`.
+      const bus = leaf.view.app.workspace as unknown as Events;
+      this.rulesRef = bus.on('atlas-vtt:collection-settings-changed', (collectionId: unknown) => {
         this.onCollectionSettingsChanged(collectionId);
       });
     } catch {
@@ -423,9 +427,12 @@ export class AtlasBinding {
       };
     }
     try {
-      // Atlas 0.21.2+: addObject
-      if (typeof (state as any).addObject === 'function') {
-        const id = (state as any).addObject('measures', data);
+      // Atlas 0.21.2+: one add per object kind. Probed with `field`, as the rest of this file
+      // probes Atlas, rather than cast to `any`: the published store type does not name it yet.
+      const addObject = field(state, 'addObject');
+      if (typeof addObject === 'function') {
+        const id = (addObject as (kind: string, input: Record<string, unknown>) => unknown)
+          .call(state, 'measures', data);
         return typeof id === 'string' && id !== '' ? id : null;
       }
       // Atlas 0.16.0-0.20.x: addMeasure
@@ -450,9 +457,11 @@ export class AtlasBinding {
     const record: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(changes)) record[key] = value;
     try {
-      // Atlas 0.21.2+: patchObject
-      if (typeof (state as any).patchObject === 'function') {
-        (state as any).patchObject('measures', id, record);
+      // Atlas 0.21.2+: one patch per object kind, a field given as undefined removed.
+      const patchObject = field(state, 'patchObject');
+      if (typeof patchObject === 'function') {
+        (patchObject as (kind: string, objectId: string, patch: Record<string, unknown>) => void)
+          .call(state, 'measures', id, record);
         return true;
       }
       // Atlas 0.16.0-0.20.x: updateMeasure
@@ -474,9 +483,11 @@ export class AtlasBinding {
     const state = this.store?.getState();
     if (state === undefined) return false;
     try {
-      // Atlas 0.21.2+: removeObjects
-      if (typeof (state as any).removeObjects === 'function') {
-        (state as any).removeObjects([id]);
+      // Atlas 0.21.2+: one removal for every kind, which also takes it out of the selection and
+      // closes its popover in the same write.
+      const removeObjects = field(state, 'removeObjects');
+      if (typeof removeObjects === 'function') {
+        (removeObjects as (ids: readonly string[]) => void).call(state, [id]);
         return true;
       }
       // Atlas 0.16.0-0.20.x: deleteMeasure

@@ -5,6 +5,7 @@ import type { BlockChange, BlockMap, Rotation } from '../terrain/blocks';
 import type { AoEShape } from '../terrain/raycast';
 import type { BlockShape } from '../terrain/shapes';
 import type { SceneRenderer } from '../view/SceneRenderer';
+import { isQuarterCellToken } from '../tokens/tokenSizes';
 
 export type BuildMode = 'add' | 'rotate' | 'remove';
 
@@ -99,6 +100,20 @@ export interface ToolHandler {
 
 export const CLICK_SLOP_PX = 5;
 
+/**
+ * Where a token of `diameter` cells lands when dropped at (x, z), in world pixels.
+ *
+ * THREE RULES, Atlas' own (`grid/gridPlacement.ts`, `snapTokenCenter`):
+ *   - a QUARTER-cell footprint (Tiny, diameter 0.5) takes the quarter of the cell the pointer lies
+ *     in: the cell's centre, moved a quarter cell towards the pointer on each axis. It used to fall
+ *     through to the even branch below — `Math.round(0.5)` is 0, which reads as even — and landed on
+ *     the corner where four cells meet, which is no quarter of any of them.
+ *   - an ODD whole footprint centres on its cell;
+ *   - an EVEN one centres where cells meet, half a cell down and right of the cell it starts from.
+ *
+ * Small (diameter 0.75) rounds to 1 and so shares Medium's cell: Atlas' own comment, "Small only
+ * changes the artwork, not the occupied cell".
+ */
 export function snapCenter(
   x: number,
   z: number,
@@ -107,6 +122,16 @@ export function snapCenter(
 ): { x: number; y: number } {
   const gx = x - grid.offsetX / grid.size;
   const gz = z - grid.offsetY / grid.size;
+  if (isQuarterCellToken(diameter)) {
+    // The cell the pointer lies in, its centre, then a quarter cell towards the pointer's side.
+    // A tie goes up and left, as Atlas' `point <= cell` does.
+    const cx = Math.floor(gx), cz = Math.floor(gz);
+    const centreX = cx + 0.5, centreZ = cz + 0.5;
+    return {
+      x: grid.offsetX + (centreX + (gx <= centreX ? -0.25 : 0.25)) * grid.size,
+      y: grid.offsetY + (centreZ + (gz <= centreZ ? -0.25 : 0.25)) * grid.size,
+    };
+  }
   const even = Math.round(diameter) % 2 === 0;
   const snap = (g: number): number => (even ? Math.round(g) : Math.floor(g) + 0.5);
   return { x: grid.offsetX + snap(gx) * grid.size, y: grid.offsetY + snap(gz) * grid.size };

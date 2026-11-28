@@ -18,7 +18,8 @@ function scene(cols = 40, rows = 4, layerHeight = 1): { map: BlockMap; meshes: T
   map.extent = { cols, rows };
   const meshes = new TerrainMeshes();
   const layout = computeLayout({ image: null, grid: GRID, extent: map.extent });
-  meshes.setOptions({ map, layout, useImage: false, gridLines: false, checker: false });
+  // `gridLines` left TerrainBuildOptions: the grid is drawn by grid/GridLayer now.
+  meshes.setOptions({ map, layout, useImage: false, checker: false });
   return { map, meshes, rebuild: () => meshes.rebuildAll() };
 }
 const ray = new THREE.Raycaster();

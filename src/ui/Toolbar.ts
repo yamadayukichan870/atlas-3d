@@ -20,9 +20,10 @@ import type { CameraKind, Tool, ViewPreset } from '../view/SceneRenderer';
  * the PRESSED WHEEL. Shift+right rotates, for a trackpad with no middle button. The left button
  * always belongs to the active tool.
  *
- * `Orbit` is now redundant with `Move` — same camera, same click-to-select — and differs only in
- * that Move also drags tokens. Merging them removes it from the `Tool` union, which touches
- * ToolController, Interaction, Toolbar, Scene3D and SceneRenderer; that is its own step.
+ * `Orbit` IS GONE, merged into `Move`. It selected but did not drag, so the user had to switch
+ * tools to do one job; and while it existed in the `Tool` union with no handler behind it, every
+ * left click on it silently did nothing. `Move` is the neutral tool now: it selects, it drags, and
+ * it stays reachable even without an editable grid.
  *
  * The measure bar speaks Atlas' six modes, where `ruler` (a path with corners) and `line` (a
  * rectangle L×W) are DIFFERENT things. The legacy four-name bar is kept only as a fallback for a
@@ -68,11 +69,11 @@ const CAMERA_HINT = 'Right drag pans (as on the 2D map), press the wheel and dra
 
 const TOOLS: ReadonlyArray<{ tool: Tool; label: string; hint: string }> = [
   {
-    tool: 'orbit',
-    label: 'Orbit',
-    hint: 'Click a token to select, right click for its menu, Ctrl+hover for its statblock. '
-      + CAMERA_HINT
-      + ' [ / ] or Alt+Q/E turn 90°, Home/Alt+H or double click centers.',
+    tool: 'move',
+    label: 'Move',
+    hint: 'Click a token to select, drag it to move (written back to Atlas), click empty ground '
+      + 'to deselect, right click a token for its menu, Ctrl+hover for its statblock, double click '
+      + 'centers. ' + CAMERA_HINT + ' [ / ] or Alt+Q/E turn 90°, Home/Alt+H centers.',
   },
   {
     tool: 'raise',
@@ -89,12 +90,6 @@ const TOOLS: ReadonlyArray<{ tool: Tool; label: string; hint: string }> = [
     label: 'Build',
     hint: 'Click to add, rotate or remove single blocks. Hold Alt to remove, Alt+R to turn the '
       + 'piece (Alt+Shift+R the other way). ' + CAMERA_HINT,
-  },
-  {
-    tool: 'move',
-    label: 'Move',
-    hint: 'Drag a token; it snaps to the grid and is written back to Atlas. Double click centers '
-      + 'the camera. ' + CAMERA_HINT,
   },
   {
     tool: 'measure',
@@ -253,7 +248,7 @@ export class Toolbar {
     this.measureClearButton = button(this.measureBar, 'Clear', 'Remove every kept measurement of the level shown (Atlas\'s own Clear)', () => handlers.onMeasureClear());
 
     this.status = root.createDiv({ cls: 'atlas3d-status' });
-    this.setTool('orbit');
+    this.setTool('move');
     this.setBrush(1);
     this.setSlice(null, 0);
     this.setMeasureState({ shape: 'line', keep: false }, 0);
